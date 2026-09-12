@@ -80,6 +80,25 @@ class LedgerApiTests(TestCase):
         self.assertEqual(response.data["clients"], [])
         self.assertEqual(response.data["debts"], [])
 
+    def test_client_update_is_scoped_to_authenticated_user(self):
+        client_id = self.create_client()
+        response = self.api.patch(f"/api/clients/{client_id}/", {
+            "name": "Ana Matola",
+            "phone": "+258 85",
+            "email": "ana@example.com",
+            "address": "Maputo",
+            "notes": "Updated on desktop",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["name"], "Ana Matola")
+        self.assertEqual(response.data["address"], "Maputo")
+
+        other = User.objects.create_user(username="client-other@example.com", password="very-secret")
+        self.api.force_authenticate(other)
+        forbidden = self.api.patch(f"/api/clients/{client_id}/", {"name": "Taken over"}, format="json")
+        self.assertEqual(forbidden.status_code, 404)
+        self.assertEqual(Client.objects.get(pk=client_id).name, "Ana Matola")
+
     def test_editing_due_date_updates_final_installment(self):
         debt = self.create_debt()
         response = self.api.patch(f"/api/debts/{debt['id']}/", {"dueDate": "2099-04-15"}, format="json")

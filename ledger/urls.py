@@ -19,6 +19,7 @@ urlpatterns = [
     path("auth/me/", views.me_view),
     path("preferences/", views.preferences_view),
     path("clients/", views.clients_view),
+    path("clients/<int:client_id>/", views.client_detail_view),
     path("debts/", views.debts_view),
     path("debts/<str:reference>/", views.debt_detail_view),
     path("debts/<str:reference>/payments/", views.debt_payment_view),
