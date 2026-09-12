@@ -10,8 +10,8 @@ from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Client, Debt, Payment, Preference, WebPushSubscription
-from .mobile_sync import sync_snapshot
+from .models import Client, Debt, MobileDevice, Payment, Preference, WebPushSubscription
+from .mobile_sync import snapshot_for_user, sync_snapshot
 from .push import get_vapid_public_key, send_push_to_user
 from .serializers import (ClientSerializer, DebtCreateSerializer, DebtSerializer, DebtUpdateSerializer,
                           MobileAuthSerializer, MobileSyncSerializer, PaymentRequestSerializer, PaymentSerializer,
@@ -103,9 +103,16 @@ def mobile_login_view(request):
     return Response({"token": token.key, "user": UserSerializer(user).data})
 
 
-@api_view(["POST"])
+@api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def mobile_sync_view(request):
+    if request.method == "GET":
+        device_id = str(request.query_params.get("deviceId", "")).strip()
+        device = None
+        if device_id:
+            device = MobileDevice.objects.filter(owner=request.user, device_id=device_id).first()
+        return Response({"snapshot": snapshot_for_user(request.user, device), "serverTime": timezone.now()})
+
     serializer = MobileSyncSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
@@ -116,7 +123,13 @@ def mobile_sync_view(request):
         batch_id=data["batchId"],
         snapshot=data["snapshot"],
     )
-    return Response({"status": "already_processed" if replayed else "completed", "counts": counts, "serverTime": timezone.now()})
+    device = MobileDevice.objects.get(owner=request.user, device_id=data["deviceId"])
+    return Response({
+        "status": "already_processed" if replayed else "completed",
+        "counts": counts,
+        "snapshot": snapshot_for_user(request.user, device),
+        "serverTime": timezone.now(),
+    })
 
 
 @api_view(["GET"])

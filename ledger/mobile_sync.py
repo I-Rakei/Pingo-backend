@@ -5,8 +5,11 @@ import json
 from datetime import date
 from decimal import Decimal
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
 
 from .models import Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment
@@ -35,12 +38,48 @@ def _count():
     return {name: {"inserted": 0, "updated": 0} for name in ("clients", "debts", "installments", "payments")}
 
 
-def _upsert(model, device, local_id, defaults, counts, bucket):
-    instance, created = model.objects.update_or_create(
-        mobile_device=device,
-        mobile_local_id=local_id,
-        defaults=defaults,
-    )
+def _owned_queryset(model, user):
+    if model is Installment:
+        return model.objects.filter(debt__owner=user)
+    return model.objects.filter(owner=user)
+
+
+def _existing_for_row(model, user, device, local_id, row):
+    server_id = row.get("serverId")
+    if server_id:
+        try:
+            instance = _owned_queryset(model, user).filter(public_id=server_id).first()
+        except (DjangoValidationError, ValueError, TypeError):
+            instance = None
+        if not instance:
+            raise ValidationError({"snapshot": f"{model.__name__} serverId is invalid or no longer exists."})
+        return instance
+    return model.objects.filter(mobile_device=device, mobile_local_id=local_id).first()
+
+
+def _mobile_is_newer(instance, row):
+    value = row.get("updatedAt")
+    if not value:
+        return True
+    parsed = parse_datetime(str(value))
+    if not parsed:
+        return True
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed > instance.updated_at
+
+
+def _upsert(model, user, device, local_id, row, defaults, counts, bucket):
+    instance = _existing_for_row(model, user, device, local_id, row)
+    if instance and row.get("serverId") and not _mobile_is_newer(instance, row):
+        return instance
+    created = instance is None
+    if created:
+        instance = model(mobile_device=device, mobile_local_id=local_id, **defaults)
+    else:
+        for field, value in defaults.items():
+            setattr(instance, field, value)
+    instance.save()
     counts[bucket]["inserted" if created else "updated"] += 1
     return instance
 
@@ -62,6 +101,77 @@ def _status_for_snapshot(debt, is_paid):
 def snapshot_hash(snapshot):
     canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _apply_deletions(user, deletions):
+    model_map = {
+        "payment": Payment,
+        "installment": Installment,
+        "debt": Debt,
+        "client": Client,
+    }
+    order = {"payment": 0, "installment": 1, "debt": 2, "client": 3}
+    deleted = {name: set() for name in model_map}
+    for item in sorted(deletions, key=lambda value: order.get(value.get("entity"), 99)):
+        entity, server_id = item.get("entity"), item.get("serverId")
+        model = model_map.get(entity)
+        if not model or not server_id:
+            continue
+        try:
+            deleted_count, _ = _owned_queryset(model, user).filter(public_id=server_id).delete()
+            if deleted_count:
+                deleted[entity].add(str(server_id))
+        except DjangoValidationError:
+            raise ValidationError({"snapshot": f"Invalid deleted {entity} serverId."})
+        except ProtectedError as exc:
+            raise ValidationError({
+                "snapshot": f"Cannot delete this {entity} while linked records still exist."
+            }) from exc
+    return deleted
+
+
+def snapshot_for_user(user, device=None):
+    clients = list(Client.objects.filter(owner=user))
+    debts = list(Debt.objects.filter(owner=user).select_related("client"))
+    installments = list(Installment.objects.filter(debt__owner=user).select_related("debt"))
+    payments = list(Payment.objects.filter(owner=user, reversed_at__isnull=True).select_related("debt", "installment"))
+
+    def local_id(instance):
+        return instance.mobile_local_id if device and instance.mobile_device_id == device.id else None
+
+    return {
+        "clients": [{
+            "serverId": str(client.public_id), "localId": local_id(client), "name": client.name,
+            "phone": client.phone, "email": client.email, "address": client.address, "notes": client.notes,
+            "createdAt": client.created_at.isoformat(), "updatedAt": client.updated_at.isoformat(),
+        } for client in clients],
+        "debts": [{
+            "serverId": str(debt.public_id), "localId": local_id(debt),
+            "clientServerId": str(debt.client.public_id), "debtorName": debt.client.name,
+            "amount": str(debt.principal), "interestRate": str(debt.interest_rate),
+            "durationMonths": debt.duration_months, "penaltyRate": str(debt.penalty_rate),
+            "totalAmount": str(debt.total), "dueDate": debt.due_date.isoformat(),
+            "startDate": debt.start_date.isoformat(), "isPaid": debt.outstanding <= 0,
+            "loanType": debt.loan_type, "capitalRemaining": str(debt.capital_remaining),
+            "reference": debt.reference, "createdAt": debt.created_at.isoformat(),
+            "updatedAt": debt.updated_at.isoformat(),
+        } for debt in debts],
+        "installments": [{
+            "serverId": str(item.public_id), "localId": local_id(item),
+            "debtServerId": str(item.debt.public_id), "installmentNumber": item.number,
+            "baseAmount": str(item.base_amount), "penaltyAmount": str(item.penalty_amount),
+            "totalAmount": str(item.amount), "dueDate": item.due_date.isoformat(),
+            "isPaid": item.paid_amount >= item.amount, "paidAmount": str(item.paid_amount),
+            "createdAt": item.created_at.isoformat(), "updatedAt": item.updated_at.isoformat(),
+        } for item in installments],
+        "payments": [{
+            "serverId": str(payment.public_id), "localId": local_id(payment),
+            "debtServerId": str(payment.debt.public_id),
+            "installmentServerId": str(payment.installment.public_id) if payment.installment else None,
+            "amount": str(payment.amount), "note": payment.note, "type": payment.payment_type,
+            "createdAt": payment.payment_date.isoformat(), "updatedAt": payment.updated_at.isoformat(),
+        } for payment in payments],
+    }
 
 
 @transaction.atomic
@@ -92,7 +202,7 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
 
     for row in clients:
         local_id = _local_id(row)
-        client_map[local_id] = _upsert(Client, device, local_id, {
+        client_map[local_id] = _upsert(Client, user, device, local_id, row, {
             "owner": user,
             "name": str(row.get("name") or "").strip(),
             "phone": str(row.get("phone") or ""),
@@ -111,10 +221,10 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
         loan_type = row.get("loanType", row.get("loan_type", Debt.LoanType.MULTI))
         if loan_type not in Debt.LoanType.values:
             raise ValidationError({"snapshot": f"Debt {local_id} has an unsupported loanType."})
-        existing = Debt.objects.filter(mobile_device=device, mobile_local_id=local_id).first()
+        existing = _existing_for_row(Debt, user, device, local_id, row)
         reference = existing.reference if existing else next_reference()
         total = _decimal(row.get("totalAmount", row.get("total_amount")), "totalAmount")
-        debt = _upsert(Debt, device, local_id, {
+        debt = _upsert(Debt, user, device, local_id, row, {
             "owner": user, "client": client, "reference": reference, "loan_type": loan_type,
             "principal": _decimal(row.get("amount"), "amount"),
             "capital_remaining": _decimal(row.get("capitalRemaining", row.get("capital_remaining")), "capitalRemaining"),
@@ -136,10 +246,14 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
         if number < 1:
             raise ValidationError({"snapshot": f"Installment {local_id} needs a positive installmentNumber."})
         # Dividas has a per-debt number uniqueness invariant in addition to its local IDs.
-        conflict = Installment.objects.filter(debt=debt, number=number).exclude(mobile_device=device, mobile_local_id=local_id).exists()
+        existing_installment = _existing_for_row(Installment, user, device, local_id, row)
+        conflicts = Installment.objects.filter(debt=debt, number=number)
+        if existing_installment:
+            conflicts = conflicts.exclude(pk=existing_installment.pk)
+        conflict = conflicts.exists()
         if conflict:
             raise ValidationError({"snapshot": f"Installment {local_id} conflicts with an existing period number."})
-        installment_map[local_id] = _upsert(Installment, device, local_id, {
+        installment_map[local_id] = _upsert(Installment, user, device, local_id, row, {
             "debt": debt, "number": number, "due_date": _date(row.get("dueDate", row.get("due_date")), "dueDate"),
             "amount": _decimal(row.get("totalAmount", row.get("total_amount")), "totalAmount"),
             "base_amount": _decimal(row.get("baseAmount", row.get("base_amount")), "baseAmount"),
@@ -159,14 +273,18 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
         payment_type = row.get("type") or Payment.PaymentType.PRINCIPAL
         if payment_type not in Payment.PaymentType.values:
             raise ValidationError({"snapshot": f"Payment {local_id} has an unsupported type."})
-        _upsert(Payment, device, local_id, {
+        _upsert(Payment, user, device, local_id, row, {
             "owner": user, "debt": debt, "client": debt.client, "installment": installment,
             "amount": _decimal(row.get("amount"), "amount"), "note": str(row.get("note") or ""),
             "payment_type": payment_type, "payment_date": _date(row.get("createdAt", row.get("created_at")), "createdAt"),
         }, counts, "payments")
 
+    deleted = _apply_deletions(user, snapshot.get("deletions", []))
+
     # Reconcile derived ledger values only after all snapshot relationships exist.
     for local_id, debt in debt_map.items():
+        if str(debt.public_id) in deleted["debt"]:
+            continue
         source = next(row for row in debts if _local_id(row) == local_id)
         is_paid = bool(source.get("isPaid", source.get("is_paid", False)))
         items = list(debt.installments.all())

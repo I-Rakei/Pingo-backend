@@ -11,7 +11,7 @@ from django.core.management import call_command
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import (Client, Debt, MobileSyncBatch, Payment, PushDelivery, WebPushSubscription)
+from .models import (Client, Debt, Installment, MobileSyncBatch, Payment, PushDelivery, WebPushSubscription)
 from .push import send_due_notifications
 
 
@@ -188,6 +188,99 @@ class MobileMigrationApiTests(TestCase):
         hijack = other_api.post("/api/mobile/sync/", {"deviceId": "phone-abc", "batchId": "batch-2", "snapshot": self.snapshot()}, format="json")
         self.assertEqual(hijack.status_code, 400)
         self.assertEqual(Client.objects.filter(owner=self.user).count(), 1)
+
+    def test_web_records_round_trip_to_mobile_without_duplicates(self):
+        client = Client.objects.create(owner=self.user, name="Web Client", address="Maputo")
+        debt = Debt.objects.create(
+            owner=self.user,
+            client=client,
+            reference="PNG-8801",
+            loan_type=Debt.LoanType.MULTI,
+            principal=Decimal("100.00"),
+            capital_remaining=Decimal("100.00"),
+            interest_rate=Decimal("10.00"),
+            penalty_rate=Decimal("0.00"),
+            duration_months=1,
+            total=Decimal("110.00"),
+            outstanding=Decimal("110.00"),
+            collected=Decimal("0.00"),
+            start_date="2099-01-01",
+            due_date="2099-02-01",
+        )
+        installment = debt.installments.create(
+            number=1,
+            due_date="2099-02-01",
+            amount=Decimal("110.00"),
+            base_amount=Decimal("110.00"),
+            paid_amount=Decimal("0.00"),
+        )
+
+        pull = self.api.get("/api/mobile/sync/?deviceId=phone-web")
+        self.assertEqual(pull.status_code, 200, pull.data)
+        snapshot = pull.data["snapshot"]
+        self.assertEqual(snapshot["clients"][0]["name"], "Web Client")
+
+        snapshot["clients"][0]["localId"] = "client-web"
+        snapshot["debts"][0]["localId"] = "debt-web"
+        snapshot["debts"][0]["clientLocalId"] = "client-web"
+        snapshot["installments"][0]["localId"] = "installment-web"
+        snapshot["installments"][0]["debtLocalId"] = "debt-web"
+
+        push = self.api.post("/api/mobile/sync/", {
+            "deviceId": "phone-web",
+            "batchId": "round-trip-1",
+            "snapshot": snapshot,
+        }, format="json")
+        self.assertEqual(push.status_code, 200, push.data)
+        self.assertEqual(Client.objects.filter(owner=self.user).count(), 1)
+        self.assertEqual(Debt.objects.filter(owner=self.user).count(), 1)
+        self.assertEqual(Installment.objects.filter(debt__owner=self.user).count(), 1)
+        self.assertEqual(str(push.data["snapshot"]["debts"][0]["serverId"]), str(debt.public_id))
+        self.assertEqual(str(push.data["snapshot"]["installments"][0]["serverId"]), str(installment.public_id))
+
+    def test_mobile_pull_is_scoped_and_deletions_are_applied(self):
+        owned = Client.objects.create(owner=self.user, name="Owned")
+        other = User.objects.create_user(username="private@example.com", email="private@example.com", password="very-secret")
+        Client.objects.create(owner=other, name="Private")
+
+        pull = self.api.get("/api/mobile/sync/")
+        self.assertEqual([item["name"] for item in pull.data["snapshot"]["clients"]], ["Owned"])
+
+        response = self.api.post("/api/mobile/sync/", {
+            "deviceId": "delete-phone",
+            "batchId": "delete-1",
+            "snapshot": {
+                "clients": [], "debts": [], "installments": [], "payments": [],
+                "deletions": [{"entity": "client", "serverId": str(owned.public_id)}],
+            },
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(Client.objects.filter(owner=self.user).exists())
+        self.assertTrue(Client.objects.filter(owner=other, name="Private").exists())
+
+    def test_offline_debt_deletion_wins_over_the_same_sync_snapshot(self):
+        first = self.sync()
+        self.assertEqual(first.status_code, 200, first.data)
+        snapshot = first.data["snapshot"]
+        snapshot["debts"][0]["clientLocalId"] = snapshot["clients"][0]["localId"]
+        snapshot["installments"][0]["debtLocalId"] = snapshot["debts"][0]["localId"]
+        snapshot["payments"][0]["debtLocalId"] = snapshot["debts"][0]["localId"]
+        snapshot["payments"][0]["installmentLocalId"] = snapshot["installments"][0]["localId"]
+        snapshot["deletions"] = [{
+            "entity": "debt",
+            "serverId": snapshot["debts"][0]["serverId"],
+        }]
+
+        response = self.api.post("/api/mobile/sync/", {
+            "deviceId": "phone-abc",
+            "batchId": "delete-debt-1",
+            "snapshot": snapshot,
+        }, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(Debt.objects.filter(owner=self.user).exists())
+        self.assertFalse(Payment.objects.filter(owner=self.user).exists())
+        self.assertEqual(response.data["snapshot"]["debts"], [])
 
 
 class WebPushApiTests(TestCase):
