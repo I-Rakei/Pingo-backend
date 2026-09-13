@@ -397,6 +397,242 @@ domain copy and behavior. Iconify supplies product icons.
 Every interactive component must account for default, hover, focus-visible,
 active, disabled, loading, and invalid/error states where those states apply.
 
+### shadcn installation and project configuration
+
+Pingo already has shadcn installed and initialized. A normal clone does not need
+`shadcn init`; restore the checked-in dependency graph from the frontend folder:
+
+```powershell
+cd "D:\ACODIGO\PINGO CORE\Pingo APP\frontend"
+npm ci
+```
+
+The committed `components.json` is part of the design system and must remain under
+version control. Its important settings are:
+
+```json
+{
+  "style": "base-nova",
+  "rsc": false,
+  "tsx": false,
+  "tailwind": {
+    "css": "src/index.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide",
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  }
+}
+```
+
+This is a JavaScript Vite project. `tsx` must stay `false`, `rsc` must stay
+`false`, and generated files belong in `src/components/ui`. The `@` alias resolves
+to `src` in both `vite.config.js` and `jsconfig.json`. Tailwind, shadcn styles,
+animations, and Inter are loaded centrally from `src/index.css`:
+
+```css
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+```
+
+For a brand-new reconstruction only, initialize shadcn after Vite, Tailwind, and
+the `@` alias are working:
+
+```powershell
+npx shadcn@latest init
+```
+
+Choose the equivalent of the committed configuration above: Base Nova, JavaScript,
+CSS variables, neutral base, `src/index.css`, and the existing aliases. Do not run
+this command over the current repository: initialization can rewrite configuration
+and global styles that Pingo has already customized.
+
+**The Checked-In Primitive Rule.** shadcn is source code, not a black-box component
+package. Files generated into `src/components/ui` are owned by Pingo, reviewed,
+customized, and committed.
+
+### Adding a shadcn component
+
+Run component commands from `Pingo APP/frontend`. Preview the generated change
+first:
+
+```powershell
+npx shadcn@latest add select --dry-run
+```
+
+Then add the component:
+
+```powershell
+npx shadcn@latest add select
+```
+
+Multiple components can be added together:
+
+```powershell
+npx shadcn@latest add checkbox popover command
+```
+
+Useful inspection commands are:
+
+```powershell
+npx shadcn@latest info
+npx shadcn@latest docs select
+npx shadcn@latest view select
+```
+
+Never use `--overwrite` casually. Existing primitives contain Pingo-specific Base
+UI fixes, dark styling, focus states, autocomplete behavior, Iconify close buttons,
+and reduced-motion handling. If regeneration is genuinely needed, inspect the
+proposed output with `--dry-run` or `--diff`, preserve local behavior, and run the
+full frontend build afterward.
+
+After adding a primitive:
+
+1. Read the generated component and its Base UI composition.
+2. Replace application-facing Lucide icons with Iconify where applicable.
+3. Normalize radius, height, colors, focus state, and motion to this document.
+4. Confirm it is dark-only and uses semantic CSS variables rather than hard-coded
+   light colors.
+5. Verify hover, keyboard focus, disabled, invalid, loading, and reduced-motion
+   behavior.
+6. Test inside dialogs, sheets, and overflow-constrained table containers.
+7. Run `npm run lint` and `npm run build`.
+
+### Using shadcn in Pingo code
+
+Import primitives through the `@/components/ui` alias and compose them in a domain
+component. Do not import Base UI directly in page components when a Pingo shadcn
+primitive already wraps it.
+
+```jsx
+import { Icon } from "@iconify/react"
+
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+
+export function ClientSearch({ value, onChange, onAdd }) {
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        type="search"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="Search clients"
+        aria-label="Search clients"
+      />
+      <Button onClick={onAdd}>
+        <Icon icon="solar:add-circle-linear" className="size-4" />
+        Add client
+      </Button>
+    </div>
+  )
+}
+```
+
+Use the exported variant API instead of duplicating button styles:
+
+```jsx
+<Button variant="outline">Cancel</Button>
+<Button variant="destructive">
+  <Icon icon="solar:trash-bin-trash-linear" className="size-4" />
+  Delete debt
+</Button>
+<Button variant="ghost" size="icon" aria-label="More debt actions">
+  <Icon icon="solar:menu-dots-bold" className="size-4" />
+</Button>
+```
+
+Use component slots as intended. A dialog is composed from root, content, header,
+title, description, body content, and footer rather than recreated with arbitrary
+fixed-position divs:
+
+```jsx
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+
+<Dialog open={open} onOpenChange={setOpen}>
+  <DialogContent className="max-w-md">
+    <DialogHeader>
+      <DialogTitle>Delete debt</DialogTitle>
+      <DialogDescription>This action removes the debt and its ledger entries.</DialogDescription>
+    </DialogHeader>
+    <div className="p-5">...</div>
+    <DialogFooter>
+      <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+      <Button variant="destructive" onClick={onConfirm}>Delete debt</Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+The `iconLibrary: "lucide"` value tells the shadcn generator how to build its own
+primitive internals. Pingo feature and navigation icons still use Iconify. Do not
+replace a stable generated internal merely to remove Lucide if doing so would
+weaken accessibility or behavior; use Iconify consistently in application-facing
+composition.
+
+**The Wrapper Rule.** Extend a shared primitive when behavior belongs everywhere.
+Apply local classes in a feature component only when the variation is specific to
+that workflow. Do not fork a second Button, Input, Dialog, Sheet, or DropdownMenu.
+
+### Base UI composition requirements
+
+Pingo's shadcn style uses `@base-ui/react`, not Radix. Examples copied from an
+older Radix-based shadcn project may have incompatible APIs. Follow the generated
+Pingo primitive and the installed Base UI version.
+
+Base UI compound parts require their matching context. For menus in particular,
+group labels and grouped items must live inside `DropdownMenuGroup` or the radio
+group equivalent. Portal-based content must retain the provided portal wrapper.
+Triggers should use the primitive's supported render/composition API rather than
+an assumed Radix `asChild` pattern.
+
+When a new component throws a missing context error, inspect the compound hierarchy
+before adding workarounds. When it clips behind a table, sheet, or card, verify the
+portal is present before changing z-index values.
+
+### Current shadcn primitive inventory
+
+The current UI directory contains the Pingo versions of:
+
+- Avatar
+- Badge
+- Button
+- Card
+- Dialog
+- Dropdown menu
+- Input
+- Label
+- Loading spinner
+- Pagination
+- Separator
+- Sheet
+- Sidebar
+- Skeleton
+- Switch
+- Table
+- Textarea
+- Tooltip
+
+Reuse these before generating an overlapping control. Add a new primitive when it
+introduces a genuinely different interaction such as Select, Checkbox, Popover,
+or Command, not merely a different color or spacing arrangement.
+
 ### Buttons
 
 **Character:** compact, direct, and stable.
