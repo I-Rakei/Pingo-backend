@@ -1,18 +1,63 @@
 import calendar
+import secrets
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
 
-from django.db import transaction
+from django.contrib.auth.models import User
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from .models import Client, Debt, Installment, Payment
+from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, DocumentSequence, Installment, Invoice,
+                     Organization, OrganizationMembership, Payment)
 
 MONEY = Decimal("0.01")
+
+DOCUMENT_MODELS = {
+    DocumentSequence.DocumentType.INVOICE: Invoice,
+    DocumentSequence.DocumentType.DEBIT_NOTE: DebitNote,
+    DocumentSequence.DocumentType.CREDIT_NOTE: CreditNote,
+    DocumentSequence.DocumentType.BALANCE_NOTE: BalanceNote,
+}
 
 
 def money(value):
     return Decimal(value).quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def get_membership(user):
+    """Returns the user's OrganizationMembership, or None for a personal
+    account. A single small helper so callers never inline the reverse
+    accessor / exception handling for the OneToOneField."""
+    return OrganizationMembership.objects.filter(user=user).select_related("organization").first()
+
+
+def resolve_scope(user):
+    """Returns the filter kwargs that scope a Client/Debt/Payment queryset to
+    the caller: {"organization": ...} for a corporate account (shared ledger
+    across Owner+Staff), or {"owner": user} for a personal account -- the
+    exact filter every existing view already used before this helper existed.
+    Personal accounts get a queryset identical to before this refactor."""
+    membership = get_membership(user)
+    if membership:
+        return {"organization": membership.organization}
+    return {"owner": user}
+
+
+def generate_share_token(client):
+    """Assign a fresh, unguessable share token to a client, invalidating any
+    previous link. Retries a handful of times on the astronomically unlikely
+    event of a collision instead of using a locked counter (unlike sequential
+    document numbers, this value has no ordering requirement)."""
+    for _ in range(5):
+        token = secrets.token_urlsafe(32)
+        client.share_token = token
+        try:
+            client.save(update_fields=["share_token", "updated_at"])
+            return token
+        except IntegrityError:
+            continue
+    raise ValidationError("Could not generate a unique share link. Try again.")
 
 
 def add_months(value, months):
@@ -28,20 +73,22 @@ def next_reference():
 
 @transaction.atomic
 def create_debt(owner, data):
+    scope = resolve_scope(owner)
+    organization = scope.get("organization")
     client_id = data.get("clientId")
     if client_id:
         try:
-            client = Client.objects.get(owner=owner, pk=client_id)
+            client = Client.objects.get(pk=client_id, **scope)
         except Client.DoesNotExist as exc:
             raise ValidationError({"clientId": "Client not found."}) from exc
     else:
-        client, _ = Client.objects.get_or_create(owner=owner, name=data["name"], defaults={"notes": "Created with a debt record."})
+        client, _ = Client.objects.get_or_create(name=data["name"], defaults={"notes": "Created with a debt record.", "owner": owner, "organization": organization}, **scope)
     principal = money(data["principal"])
     rate = Decimal(data["interestRate"])
     duration = data["durationMonths"]
     interest = money(principal * rate / 100)
     total = money(principal + interest)
-    debt = Debt.objects.create(owner=owner, client=client, reference=next_reference(), loan_type=data["loanType"],
+    debt = Debt.objects.create(owner=owner, organization=organization, client=client, reference=next_reference(), loan_type=data["loanType"],
         principal=principal, capital_remaining=principal, interest_rate=rate, penalty_rate=data.get("penaltyRate", 0),
         duration_months=duration, total=total, outstanding=total, collected=Decimal("0"), start_date=data["startDate"], due_date=data["dueDate"])
     for number in range(1, duration + 1):
@@ -60,7 +107,8 @@ def _save_debt(debt):
 
 @transaction.atomic
 def record_payment(owner, reference, data):
-    debt = Debt.objects.select_for_update().prefetch_related("installments").get(owner=owner, reference=reference)
+    scope = resolve_scope(owner)
+    debt = Debt.objects.select_for_update().prefetch_related("installments").get(reference=reference, **scope)
     if debt.status == Debt.Status.PAID:
         raise ValidationError("This debt is already paid.")
     action = data["action"]
@@ -72,7 +120,7 @@ def record_payment(owner, reference, data):
     def add_payment(value, kind, installment=None):
         if value <= 0:
             return
-        created.append(Payment.objects.create(owner=owner, debt=debt, client=debt.client, installment=installment,
+        created.append(Payment.objects.create(owner=owner, organization=debt.organization, debt=debt, client=debt.client, installment=installment,
             operation_id=operation_id, amount=money(value), payment_type=kind))
 
     if debt.loan_type == Debt.LoanType.MULTI:
@@ -145,7 +193,8 @@ def record_payment(owner, reference, data):
 
 @transaction.atomic
 def revert_installment(owner, reference, number):
-    debt = Debt.objects.select_for_update().prefetch_related("installments").get(owner=owner, reference=reference)
+    scope = resolve_scope(owner)
+    debt = Debt.objects.select_for_update().prefetch_related("installments").get(reference=reference, **scope)
     try:
         installment = debt.installments.get(number=number)
     except Installment.DoesNotExist as exc:
@@ -177,3 +226,126 @@ def revert_installment(owner, reference, number):
         debt.due_date = installment.due_date
     _save_debt(debt)
     return debt, payments
+
+
+# ---------------------------------------------------------------------------
+# Corporate accounts: organizations, staff, fiscal documents
+# ---------------------------------------------------------------------------
+
+def require_owner_role(user):
+    """Raises if the caller is not the Owner of their organization. Used by
+    every staff-management endpoint; Staff can read their org's ledger but
+    cannot manage membership."""
+    membership = get_membership(user)
+    if not membership or membership.role != OrganizationMembership.Role.OWNER:
+        raise ValidationError("Only the organization owner can do this.")
+    return membership
+
+
+@transaction.atomic
+def create_organization_with_owner(user, org_data):
+    """Attaches a brand-new Organization to a just-registered user as its
+    Owner. Called only from the registration flow (register_view /
+    mobile_register_view), never as a standalone AllowAny endpoint, so a
+    stray unauthenticated request can never attach an organization to an
+    arbitrary existing account."""
+    organization = Organization.objects.create(
+        name=org_data["name"], nuit=org_data.get("nuit", ""), address=org_data.get("address", ""),
+        iva_rate=org_data.get("ivaRate", 0), logo=org_data.get("logo", ""), created_by=user,
+    )
+    OrganizationMembership.objects.create(user=user, organization=organization, role=OrganizationMembership.Role.OWNER)
+    return organization
+
+
+def create_staff_account(owner_user, name, email, password, role):
+    membership = require_owner_role(owner_user)
+    email = email.strip().lower()
+    if len(password) < 8:
+        raise ValidationError({"password": "Use at least 8 characters."})
+    if User.objects.filter(username=email).exists():
+        raise ValidationError({"email": "An account with this email already exists."})
+    if role not in OrganizationMembership.Role.values:
+        raise ValidationError({"role": "Invalid role."})
+    first_name, _, last_name = name.strip().partition(" ")
+    with transaction.atomic():
+        user = User.objects.create_user(username=email, email=email, password=password, first_name=first_name, last_name=last_name)
+        OrganizationMembership.objects.create(user=user, organization=membership.organization, role=role)
+    return user
+
+
+def update_staff_account(owner_user, staff_user_id, name=None, email=None, password=None, role=None):
+    membership = require_owner_role(owner_user)
+    staff_membership = OrganizationMembership.objects.filter(
+        user_id=staff_user_id, organization=membership.organization,
+    ).select_related("user").first()
+    if not staff_membership:
+        raise ValidationError("Staff member not found.")
+    staff_user = staff_membership.user
+    if name is not None:
+        first_name, _, last_name = name.strip().partition(" ")
+        staff_user.first_name, staff_user.last_name = first_name, last_name
+    if email is not None:
+        email = email.strip().lower()
+        if User.objects.filter(username=email).exclude(pk=staff_user.pk).exists():
+            raise ValidationError({"email": "An account with this email already exists."})
+        staff_user.username = staff_user.email = email
+    if password is not None:
+        if len(password) < 8:
+            raise ValidationError({"password": "Use at least 8 characters."})
+        staff_user.set_password(password)
+    staff_user.save()
+    if role is not None:
+        if role not in OrganizationMembership.Role.values:
+            raise ValidationError({"role": "Invalid role."})
+        staff_membership.role = role
+        staff_membership.save(update_fields=["role", "updated_at"])
+    return staff_user, staff_membership
+
+
+def remove_staff_account(owner_user, staff_user_id):
+    membership = require_owner_role(owner_user)
+    if str(owner_user.pk) == str(staff_user_id):
+        raise ValidationError("The organization owner cannot remove their own membership.")
+    deleted, _ = OrganizationMembership.objects.filter(user_id=staff_user_id, organization=membership.organization).delete()
+    if not deleted:
+        raise ValidationError("Staff member not found.")
+
+
+@transaction.atomic
+def next_document_number(organization, document_type):
+    """Row-locked allocation, unlike next_reference()'s scan-and-max -- each
+    company's numbering is independent and gapless per document type."""
+    sequence, _ = DocumentSequence.objects.select_for_update().get_or_create(organization=organization, document_type=document_type)
+    sequence.last_number += 1
+    sequence.save(update_fields=["last_number", "updated_at"])
+    return sequence.last_number
+
+
+@transaction.atomic
+def issue_document(user, document_type, client_id, debt_reference=None, payment_id=None, amount=None, description="", **extra):
+    membership = get_membership(user)
+    if not membership:
+        raise ValidationError("Only corporate accounts can issue documents.")
+    organization = membership.organization
+    model = DOCUMENT_MODELS.get(document_type)
+    if model is None:
+        raise ValidationError({"documentType": "Unknown document type."})
+    try:
+        client = Client.objects.get(pk=client_id, organization=organization)
+    except Client.DoesNotExist as exc:
+        raise ValidationError({"clientId": "Client not found."}) from exc
+    debt = None
+    if debt_reference:
+        debt = Debt.objects.filter(reference=debt_reference, organization=organization).first()
+        if not debt:
+            raise ValidationError({"debtReference": "Debt not found."})
+    payment = None
+    if payment_id:
+        payment = Payment.objects.filter(public_id=payment_id, organization=organization).first()
+        if not payment:
+            raise ValidationError({"paymentId": "Payment not found."})
+    number = next_document_number(organization, document_type)
+    fields = dict(organization=organization, issued_by=user, client=client, debt=debt, payment=payment,
+                  number=number, amount=money(amount or 0), description=description)
+    fields.update(extra)
+    return model.objects.create(**fields)

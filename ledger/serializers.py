@@ -1,8 +1,10 @@
 from decimal import Decimal
 
+from django.conf import settings
 from rest_framework import serializers
 
-from .models import Client, Debt, Installment, Payment, Preference
+from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, Organization,
+                     OrganizationMembership, Payment, Preference)
 
 
 class MobileAuthSerializer(serializers.Serializer):
@@ -51,6 +53,10 @@ class ClientSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Client
+        # share_token is deliberately excluded here -- it is a capability token,
+        # never part of the general authenticated payload. It is only ever
+        # exposed via ClientShareSerializer from the dedicated share-management
+        # endpoint.
         fields = ["id", "publicId", "name", "phone", "email", "address", "notes", "createdAt", "updatedAt"]
 
 
@@ -173,12 +179,204 @@ class PaymentRequestSerializer(serializers.Serializer):
         return attrs
 
 
+class ClientShareSerializer(serializers.Serializer):
+    """Owner-facing view of a client's share link. Never served publicly."""
+
+    shareToken = serializers.CharField(source="share_token", allow_null=True, read_only=True)
+    shareUrl = serializers.SerializerMethodField()
+
+    def get_shareUrl(self, client):
+        if not client.share_token:
+            return None
+        base = getattr(settings, "FRONTEND_BASE_URL", "").rstrip("/")
+        return f"{base}/?share={client.share_token}"
+
+
+class ClientPublicInstallmentSerializer(serializers.ModelSerializer):
+    dueDate = serializers.DateField(source="due_date")
+    paidAmount = serializers.DecimalField(source="paid_amount", max_digits=14, decimal_places=2)
+
+    class Meta:
+        model = Installment
+        fields = ["number", "dueDate", "amount", "paidAmount"]
+
+
+class ClientPublicPaymentSerializer(serializers.ModelSerializer):
+    debtId = serializers.CharField(source="debt.reference", read_only=True)
+    type = serializers.CharField(source="payment_type", read_only=True)
+    date = serializers.DateField(source="payment_date", read_only=True)
+
+    class Meta:
+        model = Payment
+        fields = ["debtId", "amount", "type", "date"]
+
+
+class ClientPublicDebtSerializer(serializers.ModelSerializer):
+    id = serializers.CharField(source="reference", read_only=True)
+    type = serializers.SerializerMethodField()
+    loanType = serializers.CharField(source="loan_type")
+    status = serializers.SerializerMethodField()
+    dueDate = serializers.DateField(source="due_date")
+    installments = ClientPublicInstallmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Debt
+        fields = ["id", "type", "loanType", "total", "outstanding", "collected", "status", "dueDate", "installments"]
+
+    def get_type(self, obj):
+        return "Multi-period" if obj.loan_type == Debt.LoanType.MULTI else "Single loan"
+
+    def get_status(self, obj):
+        return obj.current_status
+
+
+class ClientPublicSerializer(serializers.Serializer):
+    """Read-only, unauthenticated payload for a client's own share link.
+    Deliberately excludes phone/email/address/notes and anything belonging to
+    another client or the owner's account."""
+
+    name = serializers.CharField()
+    debts = serializers.SerializerMethodField()
+    payments = serializers.SerializerMethodField()
+
+    def get_debts(self, client):
+        debts = client.debts.prefetch_related("installments")
+        return ClientPublicDebtSerializer(debts, many=True).data
+
+    def get_payments(self, client):
+        payments = client.payments.filter(reversed_at__isnull=True).select_related("debt").order_by("-payment_date")
+        return ClientPublicPaymentSerializer(payments, many=True).data
+
+
 class PreferenceSerializer(serializers.ModelSerializer):
     overdueAlerts = serializers.BooleanField(source="overdue_alerts", required=False)
 
     class Meta:
         model = Preference
         fields = ["language", "currency", "reminders", "overdueAlerts"]
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    password = serializers.CharField(trim_whitespace=False, write_only=True)
+
+
+class OrganizationSetupSerializer(serializers.Serializer):
+    """Company fields accepted alongside registration when accountType is
+    corporate. All are optional except name -- nuit/address/logo/ivaRate are
+    deliberately unvalidated free-form fields for v1 (see Organization model
+    docstring)."""
+
+    name = serializers.CharField(max_length=160)
+    nuit = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    address = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    ivaRate = serializers.DecimalField(source="iva_rate", max_digits=6, decimal_places=2, required=False, default=Decimal("0"))
+    logo = serializers.URLField(required=False, allow_blank=True)
+
+
+class OrganizationSerializer(serializers.ModelSerializer):
+    ivaRate = serializers.DecimalField(source="iva_rate", max_digits=6, decimal_places=2)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = Organization
+        fields = ["name", "nuit", "address", "ivaRate", "logo", "createdAt"]
+
+
+class StaffMemberSerializer(serializers.Serializer):
+    id = serializers.IntegerField(source="user.id", read_only=True)
+    name = serializers.SerializerMethodField()
+    email = serializers.EmailField(source="user.email", read_only=True)
+    role = serializers.CharField()
+    joinedAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    def get_name(self, membership):
+        return membership.user.get_full_name() or membership.user.email
+
+
+class StaffCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+    email = serializers.EmailField()
+    password = serializers.CharField(trim_whitespace=False, write_only=True)
+    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
+
+
+class StaffUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150, required=False)
+    email = serializers.EmailField(required=False)
+    password = serializers.CharField(trim_whitespace=False, write_only=True, required=False)
+    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices, required=False)
+
+
+class FiscalDocumentSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(source="public_id", read_only=True)
+    clientId = serializers.IntegerField(source="client_id", read_only=True)
+    clientName = serializers.CharField(source="client.name", read_only=True)
+    debtId = serializers.CharField(source="debt.reference", read_only=True, allow_null=True)
+    paymentId = serializers.UUIDField(source="payment.public_id", read_only=True, allow_null=True)
+    issueDate = serializers.DateField(source="issue_date")
+    issuedBy = serializers.SerializerMethodField()
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        fields = ["id", "number", "clientId", "clientName", "debtId", "paymentId", "issueDate", "amount", "description", "issuedBy", "createdAt"]
+
+    def get_issuedBy(self, obj):
+        return obj.issued_by.get_full_name() or obj.issued_by.email
+
+
+class InvoiceSerializer(FiscalDocumentSerializer):
+    class Meta(FiscalDocumentSerializer.Meta):
+        model = Invoice
+
+
+class DebitNoteSerializer(FiscalDocumentSerializer):
+    class Meta(FiscalDocumentSerializer.Meta):
+        model = DebitNote
+
+
+class CreditNoteSerializer(FiscalDocumentSerializer):
+    class Meta(FiscalDocumentSerializer.Meta):
+        fields = FiscalDocumentSerializer.Meta.fields + ["reason"]
+        model = CreditNote
+
+
+class BalanceNoteSerializer(FiscalDocumentSerializer):
+    class Meta(FiscalDocumentSerializer.Meta):
+        model = BalanceNote
+
+
+class DocumentCreateSerializer(serializers.Serializer):
+    clientId = serializers.IntegerField()
+    debtReference = serializers.CharField(required=False, allow_blank=True)
+    paymentId = serializers.UUIDField(required=False)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0"))
+    description = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    reason = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+
+class AmortizationScheduleSerializer(serializers.Serializer):
+    """Constructed from a dict of {organization, debt} rather than a model
+    instance -- see amortization_schedule_view."""
+
+    organization = OrganizationSerializer()
+    debtId = serializers.SerializerMethodField()
+    clientName = serializers.SerializerMethodField()
+    installments = serializers.SerializerMethodField()
+
+    def get_debtId(self, obj):
+        return obj["debt"].reference
+
+    def get_clientName(self, obj):
+        return obj["debt"].client.name
+
+    def get_installments(self, obj):
+        return InstallmentSerializer(obj["debt"].installments.all(), many=True).data
 
 
 class UserSerializer(serializers.Serializer):

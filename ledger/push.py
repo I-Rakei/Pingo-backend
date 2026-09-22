@@ -9,6 +9,7 @@ from django.db.models import F
 from django.utils import timezone
 from pywebpush import WebPushException, webpush
 
+from .client_notifications import notify_installment_due_tomorrow, notify_installment_overdue
 from .models import Installment, Preference, PushDelivery, WebPushSubscription
 
 
@@ -64,7 +65,7 @@ def send_push_to_user(user, payload):
 def send_due_notifications(today=None):
     today = today or timezone.localdate()
     tomorrow = today + timedelta(days=1)
-    totals = {"events": 0, "sent": 0, "failed": 0, "stale": 0}
+    totals = {"events": 0, "sent": 0, "failed": 0, "stale": 0, "clientEmails": 0}
     installments = Installment.objects.filter(paid_amount__lt=F("amount")).select_related(
         "debt__owner", "debt__client"
     )
@@ -72,21 +73,35 @@ def send_due_notifications(today=None):
     for installment in installments:
         debt = installment.debt
         user = debt.owner
-        if not WebPushSubscription.objects.filter(owner=user).exists():
-            continue
         preference, _ = Preference.objects.get_or_create(owner=user)
         event_key = None
         title = None
         body = None
-        if installment.due_date == tomorrow and preference.reminders:
+        is_tomorrow = installment.due_date == tomorrow and preference.reminders
+        is_overdue = installment.due_date < today and preference.overdue_alerts
+        if is_tomorrow:
             event_key = f"installment:{installment.public_id}:tomorrow"
             title = "Payment due tomorrow"
             body = f"{debt.client.name} owes {installment.amount - installment.paid_amount:.2f} {preference.currency} tomorrow."
-        elif installment.due_date < today and preference.overdue_alerts:
+        elif is_overdue:
             event_key = f"installment:{installment.public_id}:overdue:{today.isoformat()}"
             title = "Payment overdue"
             body = f"{debt.client.name} has an overdue balance of {installment.amount - installment.paid_amount:.2f} {preference.currency}."
-        if not event_key or PushDelivery.objects.filter(owner=user, event_key=event_key).exists():
+        if not event_key:
+            continue
+
+        # Client email: independent of whether the owner has a push
+        # subscription, but still deduplicated per event via PushDelivery
+        # (a distinct event_key namespace keeps it from colliding with the
+        # owner's own delivery record for the same installment/day).
+        client_event_key = f"client:{event_key}"
+        if not PushDelivery.objects.filter(owner=user, event_key=client_event_key).exists():
+            sent = notify_installment_due_tomorrow(debt, installment) if is_tomorrow else notify_installment_overdue(debt, installment)
+            if sent:
+                PushDelivery.objects.create(owner=user, event_key=client_event_key, payload={"clientEmail": debt.client.email, "debtId": debt.reference})
+                totals["clientEmails"] += 1
+
+        if not WebPushSubscription.objects.filter(owner=user).exists() or PushDelivery.objects.filter(owner=user, event_key=event_key).exists():
             continue
 
         payload = {

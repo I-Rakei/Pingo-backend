@@ -6,13 +6,19 @@ from tempfile import mkstemp
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core import mail
 from django.test import TestCase
 from django.core.management import call_command
 from django.utils import timezone
+from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from .models import (Client, Debt, Installment, MobileSyncBatch, Payment, PushDelivery, WebPushSubscription)
+from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, MobileSyncBatch,
+                     Organization, OrganizationMembership, Payment, PushDelivery, WebPushSubscription)
+from .password_reset import token_generator
 from .push import send_due_notifications
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 
 
 class LedgerApiTests(TestCase):
@@ -349,4 +355,408 @@ class WebPushApiTests(TestCase):
         self.assertEqual(first["events"], 1)
         self.assertEqual(second["events"], 0)
         self.assertEqual(sender.call_count, 1)
-        self.assertEqual(PushDelivery.objects.filter(owner=self.user).count(), 1)
+
+
+class ClientShareApiTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="owner@example.com", email="owner@example.com", password="very-secret")
+        self.other = User.objects.create_user(username="other@example.com", email="other@example.com", password="very-secret")
+        self.api = APIClient()
+        self.api.force_authenticate(self.user)
+        self.client_obj = Client.objects.create(owner=self.user, name="Ana", phone="+258 84", notes="private note")
+        self.debt = Debt.objects.create(
+            owner=self.user, client=self.client_obj, reference="PNG-5001", loan_type=Debt.LoanType.MULTI,
+            principal=Decimal("100"), capital_remaining=Decimal("100"), interest_rate=Decimal("10"),
+            duration_months=1, total=Decimal("110"), outstanding=Decimal("55"), collected=Decimal("55"),
+            start_date=timezone.localdate(), due_date=timezone.localdate() + timedelta(days=30),
+        )
+        self.installment = self.debt.installments.create(number=1, due_date=self.debt.due_date, amount=Decimal("110"), paid_amount=Decimal("55"))
+        self.payment = Payment.objects.create(
+            owner=self.user, debt=self.debt, client=self.client_obj, installment=self.installment,
+            amount=Decimal("55"), payment_type=Payment.PaymentType.PRINCIPAL,
+        )
+
+    def test_share_link_is_null_until_generated(self):
+        response = self.api.get(f"/api/clients/{self.client_obj.pk}/share/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIsNone(response.data["shareToken"])
+        self.assertIsNone(response.data["shareUrl"])
+
+    def test_owner_can_generate_and_regenerate_share_link(self):
+        first = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        self.assertEqual(first.status_code, 200, first.data)
+        first_token = first.data["shareToken"]
+        self.assertTrue(first_token)
+        self.assertIn(first_token, first.data["shareUrl"])
+
+        second = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        second_token = second.data["shareToken"]
+        self.assertNotEqual(first_token, second_token)
+
+        # The old token must 404 immediately after regeneration.
+        stale = self.api.get(f"/api/public/clients/{first_token}/")
+        self.assertEqual(stale.status_code, 404)
+        fresh = self.api.get(f"/api/public/clients/{second_token}/")
+        self.assertEqual(fresh.status_code, 200, fresh.data)
+
+    def test_share_link_by_public_id_matches_by_pk_and_is_owner_scoped(self):
+        """Mobile only knows a synced client's public_id (server_id), never
+        the integer PK, so it must be able to reach the same share flow."""
+        response = self.api.post(f"/api/clients/by-public-id/{self.client_obj.public_id}/share/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["shareToken"])
+
+        self.api.force_authenticate(self.other)
+        forbidden = self.api.get(f"/api/clients/by-public-id/{self.client_obj.public_id}/share/")
+        self.assertEqual(forbidden.status_code, 404)
+
+    def test_share_management_is_scoped_to_owner(self):
+        self.api.force_authenticate(self.other)
+        response = self.api.get(f"/api/clients/{self.client_obj.pk}/share/")
+        self.assertEqual(response.status_code, 404)
+        response = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        self.assertEqual(response.status_code, 404)
+        self.client_obj.refresh_from_db()
+        self.assertIsNone(self.client_obj.share_token)
+
+    def test_public_endpoint_returns_debts_and_payments_without_private_fields(self):
+        generate_response = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        token = generate_response.data["shareToken"]
+
+        anonymous = APIClient()
+        response = anonymous.get(f"/api/public/clients/{token}/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["name"], "Ana")
+        self.assertEqual(len(response.data["debts"]), 1)
+        self.assertEqual(response.data["debts"][0]["id"], "PNG-5001")
+        self.assertEqual(Decimal(str(response.data["debts"][0]["outstanding"])), Decimal("55.00"))
+        self.assertEqual(len(response.data["payments"]), 1)
+        self.assertEqual(Decimal(str(response.data["payments"][0]["amount"])), Decimal("55.00"))
+
+        # Private/owner-only fields must never appear in the public payload.
+        payload_text = str(response.data)
+        self.assertNotIn("private note", payload_text)
+        self.assertNotIn("+258 84", payload_text)
+        self.assertNotIn("owner", response.data)
+
+    def test_public_endpoint_hides_reversed_payments_and_unknown_token(self):
+        self.payment.reversed_at = timezone.now()
+        self.payment.save(update_fields=["reversed_at"])
+        generate_response = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        token = generate_response.data["shareToken"]
+
+        anonymous = APIClient()
+        response = anonymous.get(f"/api/public/clients/{token}/")
+        self.assertEqual(response.data["payments"], [])
+
+        missing = anonymous.get("/api/public/clients/not-a-real-token/")
+        self.assertEqual(missing.status_code, 404)
+
+    def test_public_endpoint_never_exposes_another_clients_data(self):
+        other_client = Client.objects.create(owner=self.other, name="Carlos")
+        Debt.objects.create(
+            owner=self.other, client=other_client, reference="PNG-5002", loan_type=Debt.LoanType.MULTI,
+            principal=Decimal("50"), capital_remaining=Decimal("50"), interest_rate=Decimal("5"),
+            duration_months=1, total=Decimal("55"), outstanding=Decimal("55"),
+            start_date=timezone.localdate(), due_date=timezone.localdate() + timedelta(days=30),
+        )
+        generate_response = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json")
+        token = generate_response.data["shareToken"]
+
+        anonymous = APIClient()
+        response = anonymous.get(f"/api/public/clients/{token}/")
+        debt_ids = [item["id"] for item in response.data["debts"]]
+        self.assertNotIn("PNG-5002", debt_ids)
+
+
+class PasswordResetApiTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="owner@example.com", email="owner@example.com", password="original-pass")
+        self.api = APIClient()
+
+    def valid_uid_token(self):
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        token = token_generator.make_token(self.user)
+        return uid, token
+
+    def test_request_reset_for_real_email_sends_one_email(self):
+        response = self.api.post("/api/auth/password-reset/", {"email": "owner@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("owner@example.com", mail.outbox[0].to)
+        self.assertIn("reset_uid=", mail.outbox[0].body)
+        self.assertIn("reset_token=", mail.outbox[0].body)
+
+    def test_request_reset_for_unknown_email_still_returns_200_but_sends_a_no_account_hint(self):
+        # The HTTP response stays generic (no enumeration leak to a caller),
+        # but the mailbox owner themself is told no account exists.
+        response = self.api.post("/api/auth/password-reset/", {"email": "nobody@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("nobody@example.com", mail.outbox[0].to)
+        self.assertNotIn("reset_uid=", mail.outbox[0].body)
+        self.assertIn("no Pingo account", mail.outbox[0].body)
+
+    def test_confirm_reset_sets_new_password_and_rotates_mobile_token(self):
+        old_token = Token.objects.create(user=self.user)
+        uid, token = self.valid_uid_token()
+        response = self.api.post("/api/auth/password-reset/confirm/", {"uid": uid, "token": token, "password": "brand-new-pass"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("brand-new-pass"))
+        self.assertFalse(self.user.check_password("original-pass"))
+        self.assertFalse(Token.objects.filter(pk=old_token.pk).exists())
+
+    def test_confirm_reset_rejects_tampered_token(self):
+        uid, _ = self.valid_uid_token()
+        response = self.api.post("/api/auth/password-reset/confirm/", {"uid": uid, "token": "not-a-real-token", "password": "brand-new-pass"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("original-pass"))
+
+    def test_confirm_reset_token_cannot_be_replayed_against_a_different_user(self):
+        other = User.objects.create_user(username="other@example.com", email="other@example.com", password="other-pass")
+        _, token = self.valid_uid_token()
+        other_uid = urlsafe_base64_encode(force_bytes(other.pk))
+        response = self.api.post("/api/auth/password-reset/confirm/", {"uid": other_uid, "token": token, "password": "brand-new-pass"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        other.refresh_from_db()
+        self.assertTrue(other.check_password("other-pass"))
+
+    def test_confirm_reset_rejects_weak_password(self):
+        uid, token = self.valid_uid_token()
+        response = self.api.post("/api/auth/password-reset/confirm/", {"uid": uid, "token": token, "password": "short"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("original-pass"))
+
+
+class OrganizationApiTests(TestCase):
+    def register_corporate(self, email, company_name, password="very-secret"):
+        anonymous = APIClient(enforce_csrf_checks=True)
+        csrf = anonymous.get("/api/auth/csrf/")
+        response = anonymous.post("/api/auth/register/", {
+            "email": email, "password": password, "name": "Owner",
+            "accountType": "corporate", "organization": {"name": company_name, "nuit": "123456789", "ivaRate": "16"},
+        }, format="json", HTTP_X_CSRFTOKEN=csrf.data["csrfToken"])
+        self.assertEqual(response.status_code, 201, response.data)
+        api = APIClient()
+        api.force_authenticate(User.objects.get(username=email))
+        return api
+
+    def setUp(self):
+        self.owner_email = "owner@corp.example.com"
+        self.owner_api = self.register_corporate(self.owner_email, "Acme Microcredito")
+        self.owner = User.objects.get(username=self.owner_email)
+        self.organization = OrganizationMembership.objects.get(user=self.owner).organization
+
+    def test_personal_registration_creates_no_organization(self):
+        anonymous = APIClient(enforce_csrf_checks=True)
+        csrf = anonymous.get("/api/auth/csrf/")
+        response = anonymous.post("/api/auth/register/", {"email": "solo@example.com", "password": "very-secret", "name": "Solo"}, format="json", HTTP_X_CSRFTOKEN=csrf.data["csrfToken"])
+        self.assertEqual(response.status_code, 201, response.data)
+        user = User.objects.get(username="solo@example.com")
+        self.assertFalse(OrganizationMembership.objects.filter(user=user).exists())
+
+    def test_corporate_bootstrap_reports_organization_and_role(self):
+        response = self.owner_api.get("/api/bootstrap/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["organization"]["name"], "Acme Microcredito")
+        self.assertEqual(response.data["organization"]["role"], "owner")
+
+    def test_owner_can_create_and_manage_staff(self):
+        response = self.owner_api.post("/api/organizations/staff/", {
+            "name": "Staff One", "email": "staff1@corp.example.com", "password": "staff-secret", "role": "staff",
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        staff_user_id = response.data["id"]
+        self.assertEqual(response.data["role"], "staff")
+
+        listing = self.owner_api.get("/api/organizations/staff/")
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(len(listing.data), 2)  # owner + staff
+
+        updated = self.owner_api.patch(f"/api/organizations/staff/{staff_user_id}/", {"name": "Staff Renamed", "role": "staff"}, format="json")
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data["name"], "Staff Renamed")
+
+        removed = self.owner_api.delete(f"/api/organizations/staff/{staff_user_id}/")
+        self.assertEqual(removed.status_code, 204)
+        self.assertFalse(OrganizationMembership.objects.filter(user_id=staff_user_id).exists())
+
+    def test_staff_cannot_manage_other_staff(self):
+        self.owner_api.post("/api/organizations/staff/", {
+            "name": "Staff One", "email": "staff2@corp.example.com", "password": "staff-secret", "role": "staff",
+        }, format="json")
+        staff_user = User.objects.get(username="staff2@corp.example.com")
+        staff_api = APIClient()
+        staff_api.force_authenticate(staff_user)
+
+        forbidden = staff_api.post("/api/organizations/staff/", {
+            "name": "Another", "email": "staff3@corp.example.com", "password": "staff-secret", "role": "staff",
+        }, format="json")
+        self.assertEqual(forbidden.status_code, 400)
+
+    def test_owner_and_staff_share_the_same_organization_ledger(self):
+        self.owner_api.post("/api/organizations/staff/", {
+            "name": "Staff One", "email": "staff4@corp.example.com", "password": "staff-secret", "role": "staff",
+        }, format="json")
+        staff_api = APIClient()
+        staff_api.force_authenticate(User.objects.get(username="staff4@corp.example.com"))
+
+        created = self.owner_api.post("/api/clients/", {"name": "Shared Client"}, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+
+        seen_by_staff = staff_api.get("/api/clients/")
+        self.assertEqual(len(seen_by_staff.data), 1)
+        self.assertEqual(seen_by_staff.data[0]["name"], "Shared Client")
+
+    def test_organizations_are_isolated_from_each_other(self):
+        other_api = self.register_corporate("owner2@corp.example.com", "Other Corp")
+        self.owner_api.post("/api/clients/", {"name": "Org A Client"}, format="json")
+        other_api.post("/api/clients/", {"name": "Org B Client"}, format="json")
+
+        org_a_clients = self.owner_api.get("/api/clients/")
+        self.assertEqual([c["name"] for c in org_a_clients.data], ["Org A Client"])
+
+        org_b_staff_list = self.owner_api.get("/api/organizations/staff/")
+        names = {member["email"] for member in org_b_staff_list.data}
+        self.assertNotIn("owner2@corp.example.com", names)
+
+    def test_mobile_login_blocks_corporate_accounts(self):
+        response = APIClient().post("/api/mobile/login/", {"email": self.owner_email, "password": "very-secret"}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_mobile_register_blocks_corporate_account_type(self):
+        response = APIClient().post("/api/mobile/register/", {
+            "email": "mobilecorp@example.com", "password": "very-secret", "name": "Mobile", "accountType": "corporate",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("accountType", response.data)
+
+
+class FiscalDocumentApiTests(TestCase):
+    def setUp(self):
+        anonymous = APIClient(enforce_csrf_checks=True)
+        csrf = anonymous.get("/api/auth/csrf/")
+        response = anonymous.post("/api/auth/register/", {
+            "email": "docs@corp.example.com", "password": "very-secret", "name": "Owner",
+            "accountType": "corporate", "organization": {"name": "Doc Corp"},
+        }, format="json", HTTP_X_CSRFTOKEN=csrf.data["csrfToken"])
+        self.assertEqual(response.status_code, 201, response.data)
+        self.owner = User.objects.get(username="docs@corp.example.com")
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
+        self.organization = OrganizationMembership.objects.get(user=self.owner).organization
+        client_response = self.api.post("/api/clients/", {"name": "Fatima"}, format="json")
+        self.client_id = client_response.data["id"]
+
+    def test_documents_are_numbered_independently_per_organization(self):
+        first = self.api.post("/api/organizations/documents/invoice/", {"clientId": self.client_id, "amount": "100.00", "description": "First"}, format="json")
+        self.assertEqual(first.status_code, 201, first.data)
+        self.assertEqual(first.data["number"], 1)
+        second = self.api.post("/api/organizations/documents/invoice/", {"clientId": self.client_id, "amount": "50.00", "description": "Second"}, format="json")
+        self.assertEqual(second.data["number"], 2)
+
+        other_api_owner = User.objects.create_user(username="other-corp@example.com", email="other-corp@example.com", password="very-secret")
+        other_org = Organization.objects.create(name="Other Corp", created_by=other_api_owner)
+        OrganizationMembership.objects.create(user=other_api_owner, organization=other_org, role=OrganizationMembership.Role.OWNER)
+        other_api = APIClient()
+        other_api.force_authenticate(other_api_owner)
+        other_client = other_api.post("/api/clients/", {"name": "Other Client"}, format="json")
+        other_first = other_api.post("/api/organizations/documents/invoice/", {"clientId": other_client.data["id"], "amount": "10.00"}, format="json")
+        self.assertEqual(other_first.data["number"], 1)
+
+    def test_personal_account_cannot_issue_documents(self):
+        personal = User.objects.create_user(username="solo-doc@example.com", email="solo-doc@example.com", password="very-secret")
+        personal_client = Client.objects.create(owner=personal, name="Solo Client")
+        api = APIClient()
+        api.force_authenticate(personal)
+        response = api.post("/api/organizations/documents/invoice/", {"clientId": personal_client.pk, "amount": "10.00"}, format="json")
+        self.assertEqual(response.status_code, 404)
+
+    def test_each_document_type_can_be_issued_and_listed(self):
+        for doc_type in ("invoice", "debit_note", "credit_note", "balance_note"):
+            response = self.api.post(f"/api/organizations/documents/{doc_type}/", {"clientId": self.client_id, "amount": "20.00"}, format="json")
+            self.assertEqual(response.status_code, 201, (doc_type, response.data))
+            listing = self.api.get(f"/api/organizations/documents/{doc_type}/")
+            self.assertEqual(len(listing.data), 1)
+        self.assertEqual(Invoice.objects.count(), 1)
+        self.assertEqual(DebitNote.objects.count(), 1)
+        self.assertEqual(CreditNote.objects.count(), 1)
+        self.assertEqual(BalanceNote.objects.count(), 1)
+
+    def test_amortization_schedule_returns_installments_for_owned_debt(self):
+        debt_response = self.api.post("/api/debts/", {
+            "clientId": self.client_id, "loanType": "multi", "principal": "100.00", "interestRate": "10",
+            "durationMonths": 2, "startDate": "2099-01-01", "dueDate": "2099-03-01",
+        }, format="json")
+        self.assertEqual(debt_response.status_code, 201, debt_response.data)
+        reference = debt_response.data["id"]
+
+        schedule = self.api.get(f"/api/organizations/documents/schedule/{reference}/")
+        self.assertEqual(schedule.status_code, 200, schedule.data)
+        self.assertEqual(schedule.data["organization"]["name"], "Doc Corp")
+        self.assertEqual(len(schedule.data["installments"]), 2)
+
+
+class ClientNotificationApiTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="owner@example.com", email="owner@example.com", password="very-secret")
+        self.api = APIClient()
+        self.api.force_authenticate(self.user)
+
+    def create_client_with_email(self, email="ana@example.com"):
+        response = self.api.post("/api/clients/", {"name": "Ana", "email": email}, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        return response.data["id"]
+
+    def create_debt(self, client_id, **overrides):
+        payload = {"clientId": client_id, "loanType": "multi", "principal": "100.00", "interestRate": "10", "penaltyRate": "0", "durationMonths": 1, "startDate": "2099-01-01", "dueDate": "2099-02-01"}
+        payload.update(overrides)
+        response = self.api.post("/api/debts/", payload, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        return response.data
+
+    def test_client_with_email_is_notified_when_debt_is_created(self):
+        client_id = self.create_client_with_email()
+        self.create_debt(client_id)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("ana@example.com", mail.outbox[0].to)
+        self.assertIn("new loan", mail.outbox[0].subject.lower())
+
+    def test_client_without_email_is_not_notified(self):
+        response = self.api.post("/api/clients/", {"name": "No Email Client"}, format="json")
+        self.create_debt(response.data["id"])
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_client_is_notified_when_payment_is_recorded(self):
+        client_id = self.create_client_with_email()
+        debt = self.create_debt(client_id)
+        mail.outbox.clear()
+        response = self.api.post(f"/api/debts/{debt['id']}/payments/", {"action": "balance", "amount": "50"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("ana@example.com", mail.outbox[0].to)
+        self.assertIn("payment", mail.outbox[0].subject.lower())
+
+    def test_client_is_emailed_due_tomorrow_and_overdue_reminders(self):
+        client_id = self.create_client_with_email()
+        today = timezone.localdate()
+        tomorrow_debt = self.create_debt(client_id, startDate=today.isoformat(), dueDate=(today + timedelta(days=1)).isoformat())
+        overdue_debt = self.create_debt(client_id, startDate=today.isoformat(), dueDate=(today + timedelta(days=5)).isoformat())
+        Installment.objects.filter(debt__reference=overdue_debt["id"]).update(due_date=today - timedelta(days=2))
+        mail.outbox.clear()
+
+        totals = send_due_notifications()
+        self.assertEqual(totals["clientEmails"], 2)
+        self.assertEqual(len(mail.outbox), 2)
+        subjects = sorted(message.subject for message in mail.outbox)
+        self.assertEqual(subjects, ["Payment due tomorrow", "Payment overdue"])
+
+        # Re-running the same day must not duplicate the client emails.
+        mail.outbox.clear()
+        second = send_due_notifications()
+        self.assertEqual(second["clientEmails"], 0)
+        self.assertEqual(len(mail.outbox), 0)
