@@ -74,6 +74,11 @@ class DocumentSequence(TimeStampedPublicModel):
         constraints = [models.UniqueConstraint(fields=["organization", "document_type"], name="unique_org_document_sequence")]
 
 
+class DebtReferenceSequence(models.Model):
+    name = models.CharField(max_length=16, unique=True, default="PNG")
+    last_number = models.PositiveIntegerField(default=1000)
+
+
 class Client(TimeStampedPublicModel):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="clients")
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True, related_name="clients")

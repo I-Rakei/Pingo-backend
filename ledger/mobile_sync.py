@@ -13,7 +13,7 @@ from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
 
 from .models import Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment
-from .services import money, next_reference
+from .services import money, next_reference, reconcile_debt
 
 
 def _local_id(row):
@@ -91,13 +91,6 @@ def _decimal(value, field, default="0"):
         raise ValidationError({"snapshot": f"{field} must be a valid amount."}) from exc
 
 
-def _status_for_snapshot(debt, is_paid):
-    if is_paid:
-        return Debt.Status.PAID
-    debt.set_status()
-    return debt.status
-
-
 def snapshot_hash(snapshot):
     canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -118,6 +111,13 @@ def _apply_deletions(user, deletions):
         if not model or not server_id:
             continue
         try:
+            if entity == "payment":
+                payment = _owned_queryset(Payment, user).filter(public_id=server_id).first()
+                if payment and payment.reversed_at is None:
+                    payment.reversed_at = timezone.now()
+                    payment.save(update_fields=["reversed_at", "updated_at"])
+                    deleted[entity].add(str(server_id))
+                continue
             deleted_count, _ = _owned_queryset(model, user).filter(public_id=server_id).delete()
             if deleted_count:
                 deleted[entity].add(str(server_id))
@@ -255,10 +255,12 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
             raise ValidationError({"snapshot": f"Installment {local_id} conflicts with an existing period number."})
         installment_map[local_id] = _upsert(Installment, user, device, local_id, row, {
             "debt": debt, "number": number, "due_date": _date(row.get("dueDate", row.get("due_date")), "dueDate"),
-            "amount": _decimal(row.get("totalAmount", row.get("total_amount")), "totalAmount"),
-            "base_amount": _decimal(row.get("baseAmount", row.get("base_amount")), "baseAmount"),
-            "penalty_amount": _decimal(row.get("penaltyAmount", row.get("penalty_amount")), "penaltyAmount"),
-            "paid_amount": _decimal(row.get("paidAmount", row.get("paid_amount")), "paidAmount"),
+            # v1 phones may have assessed a penalty locally. Only the base is
+            # imported; the server computes the canonical penalty and totals.
+            "amount": _decimal(row.get("baseAmount", row.get("base_amount", row.get("totalAmount", row.get("total_amount")))), "baseAmount"),
+            "base_amount": _decimal(row.get("baseAmount", row.get("base_amount", row.get("totalAmount", row.get("total_amount")))), "baseAmount"),
+            "penalty_amount": Decimal("0"),
+            "paid_amount": Decimal("0"),
         }, counts, "installments")
 
     for row in payments:
@@ -285,20 +287,7 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
     for local_id, debt in debt_map.items():
         if str(debt.public_id) in deleted["debt"]:
             continue
-        source = next(row for row in debts if _local_id(row) == local_id)
-        is_paid = bool(source.get("isPaid", source.get("is_paid", False)))
-        items = list(debt.installments.all())
-        if debt.loan_type == Debt.LoanType.MULTI:
-            debt.outstanding = money(0 if is_paid else sum((max(item.amount - item.paid_amount, 0) for item in items), Decimal("0")))
-            debt.collected = money(sum((item.paid_amount for item in items), Decimal("0")))
-        else:
-            interest_paid = sum((item.paid_amount for item in items), Decimal("0"))
-            principal_paid = sum((payment.amount for payment in debt.payments.filter(installment__isnull=True, payment_type=Payment.PaymentType.PRINCIPAL, reversed_at__isnull=True)), Decimal("0"))
-            debt.collected = money(interest_paid + principal_paid)
-            open_interest = sum((max(item.amount - item.paid_amount, 0) for item in items), Decimal("0"))
-            debt.outstanding = money(0 if is_paid else debt.capital_remaining + open_interest)
-        debt.status = _status_for_snapshot(debt, is_paid)
-        debt.save(update_fields=["outstanding", "collected", "status", "updated_at"])
+        reconcile_debt(debt)
 
     device.last_synced_at = timezone.now()
     device.save(update_fields=["last_synced_at", "updated_at"])

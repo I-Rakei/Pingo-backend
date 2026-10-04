@@ -64,6 +64,8 @@ def send_push_to_user(user, payload):
 
 def send_due_notifications(today=None):
     today = today or timezone.localdate()
+    from .services import assess_overdue_penalties
+    assess_overdue_penalties(today=today)
     tomorrow = today + timedelta(days=1)
     totals = {"events": 0, "sent": 0, "failed": 0, "stale": 0, "clientEmails": 0}
     installments = Installment.objects.filter(paid_amount__lt=F("amount")).select_related(

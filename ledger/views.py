@@ -24,7 +24,7 @@ from .serializers import (AmortizationScheduleSerializer, BalanceNoteSerializer,
                           PaymentRequestSerializer, PaymentSerializer, PreferenceSerializer, StaffCreateSerializer,
                           StaffMemberSerializer, StaffUpdateSerializer, UserSerializer, UserUpdateSerializer,
                           WebPushSubscriptionSerializer)
-from .services import (create_debt, create_organization_with_owner, create_staff_account, generate_share_token,
+from .services import (assess_overdue_penalties, create_debt, create_organization_with_owner, create_staff_account, generate_share_token,
                        get_membership, issue_document, record_payment, remove_staff_account, require_owner_role,
                        resolve_scope, revert_installment, update_staff_account)
 
@@ -181,6 +181,7 @@ def mobile_login_view(request):
 def mobile_sync_view(request):
     if get_membership(request.user):
         return Response({"detail": CORPORATE_MOBILE_BLOCK_MESSAGE}, status=status.HTTP_403_FORBIDDEN)
+    assess_overdue_penalties(resolve_scope(request.user))
     if request.method == "GET":
         device_id = str(request.query_params.get("deviceId", "")).strip()
         device = None
@@ -289,6 +290,7 @@ def preferences_view(request):
 @api_view(["GET"])
 def bootstrap_view(request):
     scope = resolve_scope(request.user)
+    assess_overdue_penalties(scope)
     clients = Client.objects.filter(**scope)
     debts = Debt.objects.filter(**scope).select_related("client").prefetch_related("installments")
     payments = Payment.objects.filter(reversed_at__isnull=True, **scope).select_related("debt", "client", "installment")
@@ -302,6 +304,7 @@ def bootstrap_view(request):
 
 @api_view(["GET"])
 def dashboard_summary_view(request):
+    assess_overdue_penalties(resolve_scope(request.user))
     debts = Debt.objects.filter(**resolve_scope(request.user))
     open_debts = [debt for debt in debts if debt.current_status != Debt.Status.PAID]
     return Response({
@@ -315,6 +318,7 @@ def dashboard_summary_view(request):
 
 @api_view(["GET"])
 def dashboard_debts_view(request):
+    assess_overdue_penalties(resolve_scope(request.user))
     debts = Debt.objects.filter(**resolve_scope(request.user)).select_related("client").prefetch_related("installments")
     return Response(DebtSerializer(debts, many=True).data)
 
@@ -380,6 +384,7 @@ def public_client_view(request, token):
 def debts_view(request):
     scope = resolve_scope(request.user)
     if request.method == "GET":
+        assess_overdue_penalties(scope)
         debts = Debt.objects.filter(**scope).select_related("client").prefetch_related("installments")
         return Response(DebtSerializer(debts, many=True).data)
     if request.method == "DELETE":
@@ -395,6 +400,8 @@ def debts_view(request):
 
 @api_view(["GET", "PATCH", "DELETE"])
 def debt_detail_view(request, reference):
+    if request.method == "GET":
+        assess_overdue_penalties(resolve_scope(request.user))
     debt = Debt.objects.filter(reference=reference, **resolve_scope(request.user)).select_related("client").prefetch_related("installments").first()
     if not debt:
         return Response({"detail": "Debt not found."}, status=status.HTTP_404_NOT_FOUND)

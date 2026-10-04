@@ -8,7 +8,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, DocumentSequence, Installment, Invoice,
+from .models import (BalanceNote, Client, CreditNote, Debt, DebtReferenceSequence, DebitNote, DocumentSequence, Installment, Invoice,
                      Organization, OrganizationMembership, Payment)
 
 MONEY = Decimal("0.01")
@@ -67,8 +67,13 @@ def add_months(value, months):
 
 
 def next_reference():
-    numbers = [int(item.reference[4:]) for item in Debt.objects.only("reference") if item.reference.startswith("PNG-") and item.reference[4:].isdigit()]
-    return f"PNG-{max(numbers, default=1000) + 1}"
+    # SQLite's IMMEDIATE transaction serializes writers before this read. The
+    # counter also avoids a ledger-wide scan as the number of debts grows.
+    with transaction.atomic():
+        sequence, _ = DebtReferenceSequence.objects.get_or_create(name="PNG")
+        sequence.last_number += 1
+        sequence.save(update_fields=["last_number"])
+        return f"PNG-{sequence.last_number}"
 
 
 @transaction.atomic
@@ -94,21 +99,83 @@ def create_debt(owner, data):
     for number in range(1, duration + 1):
         due = add_months(debt.due_date, number - duration)
         amount = interest if debt.loan_type == Debt.LoanType.SINGLE else money(total / duration)
-        Installment.objects.create(debt=debt, number=number, due_date=due, amount=amount)
+        Installment.objects.create(debt=debt, number=number, due_date=due, base_amount=amount, amount=amount)
     debt.set_status()
     debt.save(update_fields=["status", "updated_at"])
     return debt
 
 
-def _save_debt(debt):
+@transaction.atomic
+def reconcile_debt(debt, *, today=None):
+    """Derive balances and one-time overdue penalties from active payment facts.
+
+    Call inside the write transaction after all structural edits are complete.
+    This is also safe to call repeatedly when reading an overdue ledger.
+    """
+    debt.refresh_from_db()
+    today = today or timezone.localdate()
+    installments = list(debt.installments.order_by("number"))
+    payments = list(debt.payments.filter(reversed_at__isnull=True))
+    paid_by_installment = {}
+    for payment in payments:
+        if payment.installment_id:
+            paid_by_installment[payment.installment_id] = paid_by_installment.get(payment.installment_id, Decimal("0")) + payment.amount
+
+    for installment in installments:
+        base = installment.base_amount or money(installment.amount - installment.penalty_amount)
+        paid = money(paid_by_installment.get(installment.pk, Decimal("0")))
+        # Once a period was paid, its assessed penalty remains part of its
+        # historical amount. Open periods follow the current due date and rate.
+        penalty = installment.penalty_amount if paid >= installment.amount and installment.amount > 0 else (
+            money(base * debt.penalty_rate / 100) if installment.due_date < today and paid < installment.amount else Decimal("0")
+        )
+        amount = money(base + penalty)
+        changed = []
+        for field, value in (("base_amount", base), ("penalty_amount", penalty), ("amount", amount), ("paid_amount", paid)):
+            if getattr(installment, field) != value:
+                setattr(installment, field, value)
+                changed.append(field)
+        if changed:
+            installment.save(update_fields=[*changed, "updated_at"])
+
+    collected = money(sum((payment.amount for payment in payments), Decimal("0")))
+    if debt.loan_type == Debt.LoanType.MULTI:
+        total = money(sum((item.amount for item in installments), Decimal("0")))
+        outstanding = money(sum((max(item.amount - item.paid_amount, 0) for item in installments), Decimal("0")))
+        capital = debt.capital_remaining
+    else:
+        principal_paid = sum((payment.amount for payment in payments if payment.payment_type == Payment.PaymentType.PRINCIPAL and payment.installment_id is None), Decimal("0"))
+        capital = money(max(debt.principal - principal_paid, 0))
+        outstanding = money(capital + sum((max(item.amount - item.paid_amount, 0) for item in installments), Decimal("0")))
+        total = outstanding
+    changed = []
+    for field, value in (("capital_remaining", capital), ("total", total), ("collected", collected), ("outstanding", outstanding)):
+        if getattr(debt, field) != value:
+            setattr(debt, field, value)
+            changed.append(field)
+    previous_status = debt.status
     debt.set_status()
-    debt.save()
+    if debt.status != previous_status:
+        changed.append("status")
+    if changed:
+        debt.save(update_fields=[*changed, "updated_at"])
+    return debt
+
+
+def assess_overdue_penalties(scope=None, *, today=None):
+    today = today or timezone.localdate()
+    debts = Debt.objects.filter(installments__due_date__lt=today)
+    if scope:
+        debts = debts.filter(**scope)
+    for debt in debts.distinct().iterator():
+        reconcile_debt(debt, today=today)
 
 
 @transaction.atomic
 def record_payment(owner, reference, data):
     scope = resolve_scope(owner)
     debt = Debt.objects.select_for_update().prefetch_related("installments").get(reference=reference, **scope)
+    reconcile_debt(debt)
     if debt.status == Debt.Status.PAID:
         raise ValidationError("This debt is already paid.")
     action = data["action"]
@@ -152,14 +219,14 @@ def record_payment(owner, reference, data):
             if interest_due <= 0:
                 raise ValidationError("No interest is currently due.")
             if open_installment is None:
-                open_installment = Installment.objects.create(debt=debt, number=len(installments) + 1, due_date=debt.due_date, amount=interest_due)
+                open_installment = Installment.objects.create(debt=debt, number=len(installments) + 1, due_date=debt.due_date, base_amount=interest_due, amount=interest_due)
                 installments.append(open_installment)
             open_installment.paid_amount = open_installment.amount
             open_installment.save(update_fields=["paid_amount", "updated_at"])
             add_payment(interest_due, Payment.PaymentType.INTEREST, open_installment)
             next_due = add_months(open_installment.due_date, 1)
             next_interest = money(capital * debt.interest_rate / 100)
-            Installment.objects.create(debt=debt, number=max(item.number for item in installments) + 1, due_date=next_due, amount=next_interest)
+            Installment.objects.create(debt=debt, number=max(item.number for item in installments) + 1, due_date=next_due, base_amount=next_interest, amount=next_interest)
             debt.due_date, debt.total, debt.outstanding = next_due, money(capital + next_interest), money(capital + next_interest)
             debt.collected = money(debt.collected + interest_due)
         elif action == "principal":
@@ -170,8 +237,9 @@ def record_payment(owner, reference, data):
             new_interest = money(debt.capital_remaining * debt.interest_rate / 100)
             if open_installment:
                 open_installment.amount = new_interest
+                open_installment.base_amount = new_interest
                 open_installment.paid_amount = min(open_installment.paid_amount, new_interest)
-                open_installment.save(update_fields=["amount", "paid_amount", "updated_at"])
+                open_installment.save(update_fields=["amount", "base_amount", "paid_amount", "updated_at"])
             debt.collected = money(debt.collected + applied)
             debt.total = money(debt.capital_remaining + new_interest) if debt.capital_remaining else Decimal("0")
             debt.outstanding = debt.total
@@ -187,7 +255,8 @@ def record_payment(owner, reference, data):
             debt.collected = money(debt.collected + settle_amount)
         else:
             raise ValidationError({"action": "Single loans require interest, principal, or settle."})
-    _save_debt(debt)
+    debt.save()
+    reconcile_debt(debt)
     return debt, created
 
 
@@ -224,7 +293,8 @@ def revert_installment(owner, reference, number):
         debt.outstanding = money(debt.capital_remaining + (installment.amount - installment.paid_amount))
         debt.total = debt.outstanding
         debt.due_date = installment.due_date
-    _save_debt(debt)
+    debt.save()
+    reconcile_debt(debt)
     return debt, payments
 
 
