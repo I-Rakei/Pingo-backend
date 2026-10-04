@@ -178,7 +178,9 @@ def assess_overdue_penalties(scope=None, *, today=None):
         | (Q(penalty_rate__gt=0) & Exists(unpenalised)))
     if scope:
         debts = debts.filter(**scope)
-    for debt in debts.iterator():
+    # Materialise first: each reconcile commits, and on SQLite a commit
+    # invalidates an open server-side cursor.
+    for debt in list(debts):
         reconcile_debt(debt, today=today)
 
 

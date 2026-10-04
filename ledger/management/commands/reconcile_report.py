@@ -24,7 +24,8 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         changed = 0
         total = 0
-        for debt in Debt.objects.select_related("client").order_by("pk").iterator():
+        # A list, not .iterator(): each rollback or commit resets SQLite cursors.
+        for debt in list(Debt.objects.select_related("client").order_by("pk")):
             total += 1
             before, before_periods = snapshot(debt)
             with transaction.atomic():

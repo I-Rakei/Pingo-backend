@@ -483,3 +483,26 @@ class AuditFixTests(TestCase):
         call_command("reconcile_report", "--apply", stdout=StringIO())
         debt.refresh_from_db()
         self.assertEqual(debt.outstanding, Decimal("110.00"))
+
+
+class CommitPerDebtTests(TransactionTestCase):
+    """Outside a test transaction every reconcile commits, as in production."""
+
+    def make_overdue(self, user, client, index):
+        debt = create_debt(user, {"clientId": client.pk, "loanType": "multi", "principal": Decimal("100.00"),
+            "interestRate": Decimal("10.00"), "penaltyRate": Decimal("5.00"), "durationMonths": 1,
+            "startDate": timezone.localdate() - timedelta(days=60), "dueDate": timezone.localdate() + timedelta(days=30)})
+        past = timezone.localdate() - timedelta(days=index + 1)
+        Debt.objects.filter(pk=debt.pk).update(due_date=past)
+        Installment.objects.filter(debt=debt).update(due_date=past)
+        return debt
+
+    def test_assessing_many_debts_and_report_survive_commits(self):
+        from io import StringIO
+        from .services import assess_overdue_penalties
+        user = User.objects.create_user(username="commits@example.com", password="secret-pass")
+        client = Client.objects.create(owner=user, name="Many")
+        debts = [self.make_overdue(user, client, index) for index in range(3)]
+        call_command("reconcile_report", stdout=StringIO())
+        assess_overdue_penalties({"owner": user})
+        self.assertEqual({Debt.objects.get(pk=debt.pk).status for debt in debts}, {Debt.Status.OVERDUE})
