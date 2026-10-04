@@ -9,7 +9,7 @@ from pathlib import Path
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.db import OperationalError, close_old_connections, connections
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
@@ -80,6 +80,11 @@ class SyncV2Tests(TestCase):
                                  "snapshot": snapshot}, format="json")
         self.assertEqual(response.status_code, 200, response.data)
         self.assertTrue(SyncChange.objects.filter(owner=self.user, entity="client", fields__name="From phone").exists())
+
+    def test_mobile_v2_remote_flag_defaults_off_and_can_be_enabled(self):
+        self.assertEqual(self.api.get('/api/sync/v2/config/').data, {"mobileV2Enabled": False})
+        with override_settings(PINGO_MOBILE_V2_ENABLED=True):
+            self.assertEqual(self.api.get('/api/sync/v2/config/').data, {"mobileV2Enabled": True})
 
     def test_http_hello_feed_bootstrap_auth_and_device_binding(self):
         client = self.make_client()
@@ -208,6 +213,48 @@ class SyncV2Tests(TestCase):
             "op": "delete", "baseRevision": debt.client.revision}])
         self.assertEqual((deletion["status"], deletion["conflicts"][0]["reason"]), ("conflict", "has_dependents"))
         self.assertTrue(SyncConflict.objects.filter(reason="has_dependents").exists())
+
+    def test_grouped_interest_rollover_uses_initial_debt_revision(self):
+        debt = self.debt(loan_type="single")
+        base = debt.revision
+        current = debt.installments.get()
+        next_due = (timezone.localdate() + timedelta(days=60)).isoformat()
+        _, result = self.push(self.device_a, [
+            {"entity": "debt", "id": str(debt.public_id), "op": "update", "baseRevision": base,
+             "changedFields": {"dueDate": next_due}},
+            {"entity": "installment", "id": str(uuid.uuid4()), "op": "insert",
+             "debtBaseRevision": base, "fields": {"debtId": str(debt.public_id), "number": 2,
+             "dueDate": next_due, "baseAmount": "10.00"}},
+            {"entity": "payment", "id": str(uuid.uuid4()), "op": "insert", "fields": {
+             "debtId": str(debt.public_id), "installmentId": str(current.public_id),
+             "operationId": str(uuid.uuid4()), "amount": "10.00", "type": "interest",
+             "date": timezone.localdate().isoformat(), "note": ""}},
+        ], action="paySingleLoanInterest")
+        self.assertEqual(result["status"], "applied", result)
+        self.assertEqual(debt.installments.count(), 2)
+        debt.refresh_from_db()
+        self.assertEqual(debt.due_date.isoformat(), next_due)
+        self.assertEqual(debt.collected, Decimal("10.00"))
+
+    def test_grouped_principal_paydown_uses_initial_debt_revision(self):
+        debt = self.debt(loan_type="single")
+        base = debt.revision
+        current = debt.installments.get()
+        _, result = self.push(self.device_a, [
+            {"entity": "debt", "id": str(debt.public_id), "op": "update", "baseRevision": base,
+             "debtBaseRevision": base, "changedFields": {"capitalRemaining": "80.00"}},
+            {"entity": "installment", "id": str(current.public_id), "op": "update",
+             "baseRevision": current.revision, "debtBaseRevision": base,
+             "changedFields": {"baseAmount": "8.00"}},
+            {"entity": "payment", "id": str(uuid.uuid4()), "op": "insert", "fields": {
+             "debtId": str(debt.public_id), "installmentId": None,
+             "operationId": str(uuid.uuid4()), "amount": "20.00", "type": "principal",
+             "date": timezone.localdate().isoformat(), "note": ""}},
+        ], action="paySingleLoanPrincipal")
+        self.assertEqual(result["status"], "applied", result)
+        debt.refresh_from_db()
+        current.refresh_from_db()
+        self.assertEqual((debt.capital_remaining, current.base_amount), (Decimal("80.00"), Decimal("8.00")))
 
     def test_debt_delete_cascades_and_emits_child_tombstones(self):
         debt = self.debt()

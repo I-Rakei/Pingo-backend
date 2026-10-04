@@ -1,5 +1,6 @@
 """HTTP transport for the same JSON messages carried by the v2 socket."""
 
+from django.conf import settings
 from rest_framework.decorators import api_view
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -21,6 +22,11 @@ def _device_id(request):
 def _check_mobile_scope(request):
     if isinstance(request.auth, Token) and get_membership(request.user):
         raise PermissionDenied("Corporate accounts are not yet supported on mobile.")
+
+
+@api_view(["GET"])
+def config_view(request):
+    return Response({"mobileV2Enabled": settings.PINGO_MOBILE_V2_ENABLED and not bool(get_membership(request.user))})
 
 
 @api_view(["POST"])

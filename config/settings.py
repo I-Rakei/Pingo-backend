@@ -30,6 +30,7 @@ TEMPLATES = [{"BACKEND": "django.template.backends.django.DjangoTemplates", "DIR
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+PINGO_MOBILE_V2_ENABLED = os.getenv("PINGO_MOBILE_V2_ENABLED", "false").lower() == "true"
 CHANNEL_LAYERS = {"default": {"BACKEND": "channels_redis.core.RedisChannelLayer",
                               "CONFIG": {"hosts": [REDIS_URL]}}}
 # Socket counts must be shared by all ASGI workers.
