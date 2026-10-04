@@ -40,6 +40,10 @@ implementation is bidirectional and supports explicit deletion tombstones.
    keys, session cookies, mobile auth tokens, or Cloudflare tunnel tokens.
 10. Before editing, run `git status` in all three repositories. They are separate
     Git repositories and may have independent uncommitted work.
+11. Runtime writes to `Client`, `Debt`, `Installment`, and `Payment` must use
+    model `save()` or `delete()` so the v2 change log sees them. Do not use
+    `QuerySet.update()`, `bulk_create()`, or `bulk_update()` on these models
+    outside `ledger/sync_log.py`. Data migrations may update revisions directly.
 
 ## 2. What Pingo is
 

@@ -1,6 +1,7 @@
 from django.contrib import admin
 
-from .models import (Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment, Preference,
+from .models import (Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment, Preference, SyncChange,
+                     SyncConflict, SyncMutation,
                      PushDelivery, WebPushSubscription)
 
 
@@ -44,6 +45,37 @@ class MobileSyncBatchAdmin(admin.ModelAdmin):
     list_display = ("device", "batch_id", "status", "created_at")
     search_fields = ("batch_id", "device__device_id", "device__owner__username")
     readonly_fields = ("payload_hash", "counts", "created_at", "updated_at")
+
+
+class ReadOnlySyncAdmin(admin.ModelAdmin):
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(SyncChange)
+class SyncChangeAdmin(ReadOnlySyncAdmin):
+    list_display = ("id", "entity", "entity_id", "op", "owner", "organization", "created_at")
+    list_filter = ("entity", "op")
+    search_fields = ("entity_id", "owner__username", "organization__name")
+
+
+@admin.register(SyncMutation)
+class SyncMutationAdmin(ReadOnlySyncAdmin):
+    list_display = ("mutation_id", "device", "action", "status", "created_at")
+    list_filter = ("status",)
+    search_fields = ("mutation_id", "device__device_id")
+
+
+@admin.register(SyncConflict)
+class SyncConflictAdmin(ReadOnlySyncAdmin):
+    list_display = ("mutation", "entity", "entity_id", "reason", "resolved_at")
+    list_filter = ("reason", "entity")
 
 
 @admin.register(WebPushSubscription)

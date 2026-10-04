@@ -2,7 +2,7 @@ import uuid
 from decimal import Decimal
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 
@@ -13,6 +13,12 @@ class TimeStampedPublicModel(models.Model):
 
     class Meta:
         abstract = True
+
+    def save(self, *args, **kwargs):
+        # Keep post_save's SyncChange insert and revision update in the same
+        # transaction as the row, including ordinary admin and REST saves.
+        with transaction.atomic():
+            return super().save(*args, **kwargs)
 
 
 class Organization(TimeStampedPublicModel):
@@ -80,6 +86,7 @@ class DebtReferenceSequence(models.Model):
 
 
 class Client(TimeStampedPublicModel):
+    revision = models.BigIntegerField(default=0, db_index=True)
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="clients")
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True, related_name="clients")
     legacy_id = models.CharField(max_length=96, blank=True, db_index=True)
@@ -109,6 +116,7 @@ class Preference(TimeStampedPublicModel):
 
 
 class Debt(TimeStampedPublicModel):
+    revision = models.BigIntegerField(default=0, db_index=True)
     class LoanType(models.TextChoices):
         MULTI = "multi", "Multi-period"
         SINGLE = "single", "Single loan"
@@ -158,6 +166,7 @@ class Debt(TimeStampedPublicModel):
 
 
 class Installment(TimeStampedPublicModel):
+    revision = models.BigIntegerField(default=0, db_index=True)
     debt = models.ForeignKey(Debt, on_delete=models.CASCADE, related_name="installments")
     number = models.PositiveIntegerField()
     due_date = models.DateField()
@@ -177,6 +186,7 @@ class Installment(TimeStampedPublicModel):
 
 
 class Payment(TimeStampedPublicModel):
+    revision = models.BigIntegerField(default=0, db_index=True)
     class PaymentType(models.TextChoices):
         PRINCIPAL = "principal", "Principal"
         INTEREST = "interest", "Interest"
@@ -235,6 +245,52 @@ class MobileSyncBatch(TimeStampedPublicModel):
     class Meta:
         ordering = ["-created_at"]
         constraints = [models.UniqueConstraint(fields=["device", "batch_id"], name="unique_mobile_device_batch")]
+
+
+class SyncMutation(TimeStampedPublicModel):
+    device = models.ForeignKey(MobileDevice, on_delete=models.CASCADE, related_name="sync_mutations")
+    mutation_id = models.UUIDField()
+    payload_hash = models.CharField(max_length=64)
+    action = models.CharField(max_length=32, blank=True)
+    status = models.CharField(max_length=10)
+    result = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["device", "mutation_id"], name="unique_device_mutation")]
+
+
+class SyncConflict(TimeStampedPublicModel):
+    mutation = models.ForeignKey(SyncMutation, on_delete=models.CASCADE, related_name="conflicts")
+    entity = models.CharField(max_length=12)
+    entity_id = models.UUIDField()
+    reason = models.CharField(max_length=40)
+    client_payload = models.JSONField()
+    server_row = models.JSONField(default=dict)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+
+class SyncChange(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE)
+    organization = models.ForeignKey(Organization, null=True, blank=True, on_delete=models.CASCADE)
+    entity = models.CharField(max_length=12)
+    entity_id = models.UUIDField(db_index=True)
+    op = models.CharField(max_length=8)
+    fields = models.JSONField(default=dict)
+    changed_fields = models.JSONField(default=list)
+    origin_device = models.ForeignKey(MobileDevice, null=True, blank=True, on_delete=models.SET_NULL)
+    mutation = models.ForeignKey(SyncMutation, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["owner", "id"]), models.Index(fields=["organization", "id"])]
+
+
+class SyncCursorFloor(models.Model):
+    """Highest compacted cursor per scope; distinguishes expiry from a new ledger."""
+    owner = models.OneToOneField(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE)
+    organization = models.OneToOneField(Organization, null=True, blank=True, on_delete=models.CASCADE)
+    floor = models.BigIntegerField(default=0)
 
 
 class WebPushSubscription(TimeStampedPublicModel):

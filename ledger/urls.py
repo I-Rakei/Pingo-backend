@@ -1,8 +1,13 @@
 from django.urls import path
 
 from . import views
+from . import sync_v2_views
 
 urlpatterns = [
+    path("sync/v2/hello/", sync_v2_views.hello_view),
+    path("sync/v2/changes/", sync_v2_views.changes_view),
+    path("sync/v2/push/", sync_v2_views.push_view),
+    path("sync/v2/bootstrap/", sync_v2_views.bootstrap_view),
     path("bootstrap/", views.bootstrap_view),
     path("dashboard/summary/", views.dashboard_summary_view),
     path("dashboard/debts/", views.dashboard_debts_view),
