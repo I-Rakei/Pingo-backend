@@ -87,4 +87,7 @@ def reset_password(uid, token, password):
     user.set_password(password)
     user.save(update_fields=["password"])
     Token.objects.filter(user=user).delete()  # force re-login everywhere; old tokens invalidated
+    from django.db import transaction
+    from .sync_log import notify_auth_revoked
+    transaction.on_commit(lambda: notify_auth_revoked(user.pk))
     return user

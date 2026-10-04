@@ -1,6 +1,7 @@
 """Append-only, scope-filtered v2 ledger feed."""
 
 import logging
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import timezone as utc_timezone
@@ -8,10 +9,12 @@ from datetime import timezone as utc_timezone
 from django.db import transaction
 from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
+from rest_framework.authtoken.models import Token
 
-from .models import Client, Debt, Installment, Payment, SyncChange
+from .models import Client, Debt, Installment, OrganizationMembership, Payment, SyncChange
 
 logger = logging.getLogger(__name__)
+_last_broadcast_error = 0.0
 SYNC_MODELS = {Client: "client", Debt: "debt", Installment: "installment", Payment: "payment"}
 _origin = ContextVar("pingo_sync_origin", default=(None, None))
 
@@ -90,8 +93,36 @@ def notify_scope(scope, first_id, last_id):
             return
         group = f"ledger.org.{scope['organization_id']}" if scope["organization_id"] else f"ledger.user.{scope['owner_id']}"
         async_to_sync(layer.group_send)(group, {"type": "ledger.changed", "from": first_id, "to": last_id})
-    except Exception:
-        logger.exception("Could not broadcast ledger change cursor %s", last_id)
+    except Exception as exc:
+        _log_broadcast_error(exc)
+
+
+def _log_broadcast_error(exc):
+    # Redis outages must never fail an HTTP write. One warning per minute keeps
+    # a bulk import or test run from producing thousands of identical traces.
+    global _last_broadcast_error
+    now = time.monotonic()
+    if now - _last_broadcast_error > 60:
+        logger.warning("Could not broadcast realtime event: %s", exc)
+        _last_broadcast_error = now
+
+
+def notify_auth_revoked(user_id):
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        layer = get_channel_layer()
+        if layer is not None:
+            async_to_sync(layer.group_send)(f"auth.user.{user_id}", {"type": "auth.revoked"})
+    except Exception as exc:
+        _log_broadcast_error(exc)
+
+
+@receiver(post_delete, sender=Token)
+@receiver(post_delete, sender=OrganizationMembership)
+def revoke_deleted_credential(sender, instance, **kwargs):
+    transaction.on_commit(lambda: notify_auth_revoked(instance.user_id))
 
 
 @receiver(pre_save, sender=Client)
