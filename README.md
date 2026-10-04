@@ -1,6 +1,9 @@
 # Pingo backend
 
-Django REST API for the Pingo frontend. It uses SQLite, Django's built-in `User`, session cookies, CSRF protection, Django REST Framework, and `django-cors-headers`.
+Django API for the Pingo web app and Dividas mobile app. SQLite is the ledger;
+browser sessions use CSRF, native clients use DRF tokens. Protocol v2 adds a
+transactional change log, HTTP sync, and a Channels WebSocket feed. The server
+flag for mobile v2 defaults to off, and production has not yet moved to ASGI/Redis.
 
 ## Run locally
 
@@ -15,11 +18,23 @@ py manage.py runserver
 
 The API is at `http://127.0.0.1:8000/api/`. Add the Vite origin to `CORS_ALLOWED_ORIGINS` before using cookie-based requests from the frontend. Fetch `/api/auth/csrf/` with `credentials: "include"`, send its token as `X-CSRFToken` for every write, and also use `credentials: "include"`.
 
+For local WebSocket testing, start Redis at the `REDIS_URL` in `.env`, then run
+`py -m uvicorn config.asgi:application --host 127.0.0.1 --port 8000` instead of
+`runserver`. `/ws/ledger/` accepts a browser session with an allowed Origin
+or a native `Authorization: Token <token>` handshake. It supports `hello`,
+`changes`, `push`/`push_result`, `ack`, and `ping`/`pong`. The web client uses
+change notices to debounce a fresh `/api/bootstrap/` request. The production
+switch to ASGI/Redis is an operator rollout step; no deployment is implied here.
+
 ## Frontend routes
 
 `GET /api/bootstrap/` returns `{ user, settings, clients, debts, payments }`. Dashboard consumers can use `GET /api/dashboard/summary/` and `GET /api/dashboard/debts/`. Other routes are `GET /api/auth/csrf/`, `POST /api/auth/register/`, `POST /api/auth/login/`, `POST /api/auth/logout/`, `GET/PATCH /api/auth/me/`, `GET/PATCH /api/preferences/`, `GET/POST /api/clients/`, `GET/POST/DELETE /api/debts/`, `GET/PATCH/DELETE /api/debts/:id/`, `POST /api/debts/:id/payments/`, and `POST /api/debts/:id/installments/:number/revert/`.
 
-All ledger output is camelCase. Debt `id` stays a display-compatible `PNG-...` reference; `publicId`, `createdAt`, and `updatedAt` provide sync-safe identity and change tracking. Payment and reversion responses return `{ debt, payments }`.
+Web ledger output is camelCase. Debt `id` stays a display-compatible `PNG-...`
+reference; `publicId`, `createdAt`, and `updatedAt` provide sync-safe identity
+and change tracking. Payment and reversion responses return `{ debt, payments }`.
+`GET/POST /api/clients/by-public-id/:uuid/share/` lets an authenticated mobile
+client fetch or regenerate a public client profile link after syncing that client.
 
 ## Dividas SQLite import
 
@@ -31,9 +46,11 @@ py manage.py import_dividas_sqlite "C:\path\to\dividas_v3.db" --user owner@examp
 
 The command recognizes the `clients`, `debts`, `installments`, and `payments` schema in `Dividas/lib/database.ts`, retains legacy IDs in sync fields, and is idempotent for the same user/database. It prints warnings for missing client links, missing related rows, reference collisions, and totals that do not reconcile.
 
-## Opt-in mobile migration and sync
+## Mobile accounts and legacy v1 sync
 
-Dividas remains offline-first: the phone keeps its SQLite data even after a successful cloud migration. The mobile app may continue offline, or a user can explicitly create/sign in to a Pingo cloud account from Settings and upload a snapshot. Browser session authentication is unchanged; native requests use the returned DRF token:
+Dividas remains offline-first: the phone keeps its `dividas_v3.db` ledger after
+cloud migration. The user connects a personal Pingo account in Settings. Browser
+session authentication is unchanged; native requests use the returned DRF token:
 
 ```http
 POST /api/mobile/register/
@@ -64,7 +81,40 @@ Content-Type: application/json
 
 `localId` is required for every row. Current raw SQLite `id`, `client_id`, `debt_id`, and `installment_id` names are accepted as compatibility aliases, but the app should send the explicit names above. IDs are namespaced by `deviceId`, then scoped to the authenticated user, preventing two phones or two accounts from colliding.
 
-The endpoint only upserts uploaded records. It never deletes cloud or phone data because a row is absent from a snapshot. A successful reply contains `status`, per-collection `counts.inserted`/`counts.updated`, and `serverTime`. Repeating the same `deviceId` + `batchId` with identical data returns `status: "already_processed"` and makes no duplicate records; reusing a batch ID for different data is rejected. The app can safely retry an interrupted upload and schedule later uploads (for example, every hour while online) using a new batch ID each time.
+`POST /api/mobile/sync/` upserts the snapshot. Missing rows are not deletions;
+explicit `deleted` UUID tombstones are processed in dependency order. The reply
+includes `status`, inserted/updated counts, and `serverTime`. Repeating one
+`deviceId` + `batchId` with identical data returns `already_processed`; reusing
+the batch ID for different data is rejected. `GET /api/mobile/sync/` returns the
+canonical account snapshot. V1 phones sync on startup, roughly every 30 seconds
+while active, on reconnect/foreground, and on manual refresh. Keep this endpoint
+for older APKs through the D5 compatibility window after v2 rollout.
+
+## Protocol v2
+
+V2 is available over the same scoped service through HTTP and `/ws/ledger/`:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/sync/v2/config/` | Mobile rollout flag; false by default |
+| POST | `/api/sync/v2/hello/` | Bind a device and report cursor status |
+| GET | `/api/sync/v2/changes/` | Fetch ordered changes, at most 500 per page |
+| GET | `/api/sync/v2/bootstrap/` | Recover from an expired cursor |
+| POST | `/api/sync/v2/push/` | Apply an idempotent grouped mutation |
+
+The upgraded phone finishes one v1 cycle and imports a canonical v2 bootstrap
+before switching protocols. Local changes and an outbox entry commit in one
+SQLite transaction. The foreground socket drains that outbox immediately, uses
+cursor catch-up, and reconnects with backoff. After repeated socket failures,
+background sync, or manual sync, it uses HTTP v2. Server revisions and field
+merges handle editable data; protected or structural conflicts remain in the
+mobile Settings inbox for re-apply or discard. Reversed payments stay as facts
+in v2. The 30-second foreground timer remains only while a phone uses v1.
+
+`PINGO_MOBILE_V2_ENABLED=false` keeps mobile discovery on v1 until the operator
+enables a device-first rollout. Corporate accounts remain blocked on mobile.
+V1 batches, tombstones, and the endpoint must remain until the post-rollout D5
+window has elapsed and old APKs are accounted for.
 
 ## Browser push notifications
 
@@ -87,5 +137,11 @@ Alternatively, schedule `py manage.py send_due_notifications` hourly. Web Push r
 ## Verification
 
 ```powershell
-py manage.py test
+py manage.py test ledger
+py manage.py makemigrations --check --dry-run
 ```
+
+Web lint/build and Dividas TypeScript, lint, SQLite contract, and socket tests
+are documented in `MASTER_CONTEXT.md` section 13. Release APK upgrade, real
+Redis/ASGI, two-browser-tab, phone-to-web latency, airplane-mode, and background
+runtime checks remain operator rollout gates.

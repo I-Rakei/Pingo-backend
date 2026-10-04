@@ -1,6 +1,6 @@
 # Pingo Master Context
 
-Last audited: 2026-09-12
+Last audited: 2026-10-04 (protocol v2 code; deployment and device gates pending)
 
 This is the primary handoff document for Pingo. Read it before changing the
 backend, web frontend, or Dividas mobile application. It records the product
@@ -8,10 +8,9 @@ intent, the implementation that exists today, the contracts between the three
 applications, deployment details, and the invariants that must survive future
 work.
 
-The code remains the final authority. Where an older README conflicts with this
-document, inspect the named source files before making a decision. In particular,
-the backend README contains an older description of mobile sync; the current
-implementation is bidirectional and supports explicit deletion tombstones.
+The code remains the final authority. Protocol v2 is implemented but disabled
+for mobile by the server flag until rollout. The v1 snapshot endpoint remains
+active for older phones; production has not yet switched to ASGI/Redis.
 
 ## 1. Non-negotiable rules
 
@@ -34,8 +33,8 @@ implementation is bidirectional and supports explicit deletion tombstones.
    existing migration strategy casually. The app is branded Pingo, but installed
    versions still rely on `dividas_v3.db`, `com.dividas.app`, and the `dividas`
    scheme. Renaming them can strand existing users' data or install a second app.
-8. Sync deletion is explicit. A row missing from an uploaded snapshot is not by
-   itself a delete. Use tombstones.
+8. Sync deletion is explicit. A row missing from an uploaded v1 snapshot is not
+   by itself a delete. V1 uses tombstones; v2 uses ordered delete mutations.
 9. Do not commit production secrets, the SQLite cloud database, VAPID private
    keys, session cookies, mobile auth tokens, or Cloudflare tunnel tokens.
 10. Before editing, run `git status` in all three repositories. They are separate
@@ -56,15 +55,19 @@ The system has three cooperating applications:
 
 ```text
 Pingo web (React/Vite) ---- session + CSRF ----+
+          |                                    |
+          +---- session + Origin WebSocket -----+
                                                |
                                                v
                                       Django REST API
+                                      + Channels/ASGI
                                                |
                                                v
                                       cloud SQLite database
                                                ^
                                                |
 Dividas/Pingo mobile ---- DRF token + sync ----+
+          +---- token WebSocket (v2) ----------+
         |
         +---- local SQLite database (offline source of work)
 ```
@@ -94,7 +97,7 @@ The three repositories are:
 | React web | `Pingo APP/frontend` | `https://github.com/I-Rakei/Pingo-frontend.git` |
 | Expo mobile | `Dividas` | `https://github.com/I-Rakei/Dividas.git` |
 
-All were on branch `master` and clean at the last audit. The audited commits were:
+All were on branch `master` and clean at the 2026-09-12 audit. The commits then were:
 
 ```text
 backend:  71eaa1d feat: Add client detail view with update functionality scoped to authenticated user
@@ -120,12 +123,14 @@ git -C "Dividas" status
 - `django-cors-headers`
 - SQLite at `backend/db.sqlite3`
 - `pywebpush` with VAPID keys
-- Gunicorn and WSGI in production
-- PM2 supervises Gunicorn and the notification worker
-- Cloudflare Tunnel publishes the private local Gunicorn port
+- Django Channels, channels-redis, Redis client, and `config.asgi` for protocol v2
+- Uvicorn dependency for the planned ASGI deployment; production is still on
+  Gunicorn/WSGI until the human operator performs the rollout
+- PM2 supervises the current API process and notification worker
+- Cloudflare Tunnel publishes the private local API port
 
-There is no Flask, PostgreSQL, Redis, Celery, Django Channels, WebSocket server,
-or ASGI application in the current architecture.
+There is no Flask, PostgreSQL, or Celery in this architecture. Redis and ASGI
+are configured in code but have not been installed or enabled on the VPS.
 
 ### Web frontend
 
@@ -166,13 +171,19 @@ backend/
   config/
     settings.py          environment, database, DRF, CORS, VAPID
     urls.py              `/admin/` and `/api/`
-    wsgi.py              Gunicorn entry point
+    wsgi.py              current Gunicorn entry point / rollback
+    asgi.py              planned HTTP and WebSocket entry point
   ledger/
     models.py            persistent domain model
     serializers.py       API validation and response shapes
     services.py          debt creation, payments, reversals, calculations
     views.py             auth and HTTP endpoints
-    mobile_sync.py       bidirectional snapshot merge protocol
+    mobile_sync.py       legacy v1 snapshot merge protocol
+    sync_log.py          transactional change log and broadcasts
+    sync_v2.py           scoped mutation, cursor feed, bootstrap
+    sync_v2_views.py     HTTP v2 transport
+    consumers.py         WebSocket v2 transport
+    ws_auth.py           token/session handshake and Origin check
     push.py              web push delivery helpers
     urls.py              API route table
     tests.py             backend behavioral and isolation tests
@@ -195,6 +206,8 @@ DJANGO_SECRET_KEY=replace-with-a-long-random-value
 DJANGO_DEBUG=false
 DJANGO_ALLOWED_HOSTS=*
 CORS_ALLOWED_ORIGINS=https://pingo.rakei.co.za
+REDIS_URL=redis://127.0.0.1:6379/0
+PINGO_MOBILE_V2_ENABLED=false
 TIME_ZONE=Africa/Johannesburg
 VAPID_PRIVATE_KEY=.secrets/vapid_private.pem
 VAPID_SUBJECT=mailto:admin@example.com
@@ -206,7 +219,8 @@ If this becomes a public service, restrict it to the actual hostname.
 
 `CORS_ALLOWED_ORIGINS` also becomes `CSRF_TRUSTED_ORIGINS`. Origins must be exact,
 including scheme and port. Session cookies are sent cross-origin with
-`CORS_ALLOW_CREDENTIALS=True`.
+`CORS_ALLOW_CREDENTIALS=True`. WebSocket session handshakes validate the Origin
+against the same list; native token handshakes use an Authorization header.
 
 The ignored runtime files are:
 
@@ -308,14 +322,20 @@ before the server's local date, otherwise unpaid.
 - `reversed_at` implements soft reversal
 - optional mobile origin identity
 
-Normal API and sync snapshots exclude reversed payments. Reversal preserves an
-audit trail instead of physically deleting the payment row.
+Web and v1 sync snapshots exclude reversed payments. V2 bootstrap and changes
+include reversal facts so a phone can preserve the audit trail and recompute
+balances without physically deleting payment rows.
 
 ### Sync and push models
 
 - `MobileDevice`: binds a stable app-generated `device_id` to exactly one user.
 - `MobileSyncBatch`: stores device, batch ID, payload hash, status, and counts so
-  retries cannot duplicate data.
+  legacy v1 retries cannot duplicate data.
+- `SyncChange`: scoped, ordered row change with a server cursor.
+- `SyncMutation`: idempotency record for a v2 device mutation.
+- `SyncConflict`: persisted protected/structural conflict for a mobile inbox.
+- `SyncCursorFloor`: oldest retained cursor after change-log compaction.
+- `DebtReferenceSequence`: transactional next `PNG-N` reference counter.
 - `WebPushSubscription`: stores a user's browser endpoint and Web Push keys.
 - `PushDelivery`: deduplicates scheduled events by `(owner, event_key)`.
 
@@ -326,10 +346,9 @@ clamps dates to the last valid day in the destination month.
 
 ### Reference generation
 
-`next_reference()` scans existing `PNG-N` references and returns the next number,
-starting after 1000. This is simple but not safe against simultaneous writers in
-multiple Gunicorn workers. If write concurrency increases, replace it with a
-database-backed sequence or retry on unique constraint failure.
+`next_reference()` uses a transaction-protected `DebtReferenceSequence` row,
+seeded from existing `PNG-N` references. SQLite write transactions serialize
+concurrent allocations; regression tests cover simultaneous creation.
 
 ### Debt creation
 
@@ -410,6 +429,11 @@ integer database ID. Sync identities are UUID strings.
 | POST | `/api/debts/<reference>/installments/<number>/revert/` | Reverse a period |
 | GET | `/api/payments/` | List active owned payments |
 | GET, POST | `/api/mobile/sync/` | Pull or merge a mobile snapshot |
+| GET | `/api/sync/v2/config/` | Authenticated mobile v2 rollout flag (off by default) |
+| POST | `/api/sync/v2/hello/` | Bind a v2 device and get cursor status |
+| GET | `/api/sync/v2/changes/` | Read a scoped cursor page (maximum 500 rows) |
+| GET | `/api/sync/v2/bootstrap/` | Read canonical v2 rows after migration or cursor expiry |
+| POST | `/api/sync/v2/push/` | Apply an idempotent grouped mutation |
 | GET, POST, DELETE | `/api/push/subscription/` | Manage browser subscriptions |
 | POST | `/api/push/test/` | Send a test browser notification |
 
@@ -417,15 +441,23 @@ integer database ID. Sync identities are UUID strings.
 installments embedded with debts, and active payments. The web app treats this as
 its canonical refresh payload.
 
+`/ws/ledger/` is the protocol v2 socket path under the ASGI app. Mobile sends
+`Authorization: Token <key>` on the handshake; web uses its same-site session
+cookie and an exact allowed Origin. The socket carries hello/welcome, changes,
+push/push_result, ack, and ping/pong. Unauthenticated or revoked connections
+close with 4401. The web uses this feed to debounce a fresh `/api/bootstrap/`
+request after an external change.
+
 ## 9. Bidirectional mobile sync
 
-The authoritative server implementation is `ledger/mobile_sync.py`. The mobile
-orchestrator is `Dividas/lib/cloud-sync.ts`; serialization and merge logic live in
-`Dividas/lib/database.ts`.
+The legacy v1 snapshot service is `ledger/mobile_sync.py`. Protocol v2 is in
+`ledger/sync_v2.py`, with HTTP and WebSocket transports. Mobile orchestration
+is `Dividas/lib/cloud-sync.ts`; the v2 outbox, import engine, HTTP transport,
+and foreground socket are in `Dividas/lib/sync/`.
 
-### Sync sequence
+### Legacy v1 sync sequence
 
-When connected, mobile performs this sequence:
+Before v2 is enabled for a device, connected mobile performs this sequence:
 
 1. Read token and enabled state. If not connected, do nothing.
 2. Confirm network reachability.
@@ -469,10 +501,10 @@ Existing rows use row-level last-write-wins based on `updatedAt`. Mobile overwri
 an existing server row only when its timestamp is later. Missing or invalid mobile
 timestamps are treated as mobile-newer for migration compatibility.
 
-This is not a field-level merge. Two devices editing different fields on the same
+V1 is not a field-level merge. Two devices editing different fields on the same
 row at nearly the same time can still lose one edit. Device clock skew can also
 influence the winner because phone timestamps originate from its local clock.
-There is no vector clock, sync version, or per-field conflict UI today.
+The v1 path has no per-field conflict inbox.
 
 ### Idempotency
 
@@ -501,9 +533,37 @@ the phone ledger and pending tombstones intact.
 This is the core guarantee behind "data on the user's phone must not disappear."
 Any sync rewrite needs regression tests for it.
 
+### Protocol v2 (flagged, not yet rolled out)
+
+`PINGO_MOBILE_V2_ENABLED=false` is the default. An upgraded phone on v1 first
+finishes one full v1 cycle. If every active row has a server UUID, it binds its
+device with v2 hello, imports a canonical bootstrap, stores the cursor, and
+switches `sync_state.protocol` to `v2`. Failed requests leave it on v1 for retry.
+The SQLite filename remains `dividas_v3.db`; migration adds revision,
+reference, operation ID, outbox, context, and trigger tables without clearing
+the ledger. Unsynced reversed legacy payment facts are queued for v2 upload.
+
+On v2, `mutate()` commits the ledger action and its UUID-keyed outbox payload in
+one SQLite transaction. Triggers capture row changes only for local actions;
+remote imports suppress them. The phone applies ordered cursor pages in a
+transaction and retains fields with a pending local mutation. Outbox pushes are
+sequential and idempotent; a lost reply is retried with the same mutation ID.
+Server payment facts and server-assessed penalties determine derived totals.
+Structural debt/period edits require the starting debt revision. Client and
+editable debt terms merge at field level; protected or structural conflicts
+stay in the Settings conflict inbox until the user re-applies or discards them.
+
+The foreground uses `/ws/ledger/`: token header, hello/catch-up, changes,
+push_result, ack, and 25-second ping/pong. A committed local action drains
+immediately. It reconnects with jittered exponential backoff and uses the HTTP
+v2 endpoints after three failed handshakes. A background task and manual sync
+use HTTP v2 directly. The socket closes 30 seconds after backgrounding. Cursor
+expiry triggers a non-destructive bootstrap. The server retains v1 during the
+rollout window; v1 and v2 writes both enter the change log.
+
 ### Schedule and freshness
 
-Foreground mobile sync is attempted:
+On v1, foreground mobile sync is attempted:
 
 - at scheduler startup
 - every 30 seconds while the app is active
@@ -516,13 +576,14 @@ appear on mobile after the next successful cycle.
 
 The background task requests a minimum interval of 15 minutes. Android and iOS
 control actual execution, so it is inexact and not guaranteed while the app is
-closed. The 30-second promise applies only while the app is active. There are no
-WebSockets, and that is an intentional current decision.
+closed. The 30-second timer stops when that phone switches to v2. Background
+execution is still controlled by Android and iOS, so updates while the app is
+closed are eventual rather than immediate.
 
-Important desktop limitation: the web app does not currently poll the server. It
-refreshes after its own writes and on initial load. If mobile changes the cloud
-ledger while a desktop tab remains open, that tab needs a browser refresh or a
-subsequent local mutation before it fetches the new snapshot.
+The web app now subscribes to the same scoped change feed and refreshes its
+workspace after a 500 ms debounce. The ASGI/Redis deployment and two-browser-tab
+runtime check remain pending; production still behaves as the earlier WSGI
+deployment until the operator switches it.
 
 ## 10. Web frontend architecture
 
@@ -534,6 +595,7 @@ frontend/src/
   main.jsx                      React root and service worker registration
   index.css                     dark tokens, Inter, layout and loading styles
   lib/api.js                    fetch, sessions, CSRF, API methods, error handling
+  lib/live.js                   authenticated WebSocket cursor and reconnect
   lib/pingo-data.js             formatting helpers and legacy/sample helpers
   lib/push.js                   browser Push API integration
   components/
@@ -651,7 +713,8 @@ from Expo local notifications on the native app.
 
 - Bootstrap returns the entire account ledger; filtering and pagination are
   client-side. Server pagination will be needed for large datasets.
-- There is no live desktop polling or WebSocket subscription.
+- Live updates currently refetch the full workspace after a 500 ms debounce;
+  row patching and server pagination are future scalability work.
 - Navigation is not URL-addressable except for debt notification query links.
 - The current production bundle reports a chunk larger than 500 kB after
   minification. Code splitting is a future optimization, not a functional blocker.
@@ -676,9 +739,14 @@ Dividas/
   app/(tabs)/settings.tsx
   app/client/[id].tsx
   app/debt/[id].tsx
+  app/sync-conflicts.tsx
   components/cloud-migration-card.tsx
   lib/database.ts               schema, migrations, ledger operations, sync import/export
-  lib/cloud-sync.ts             cloud auth and sync scheduling
+  lib/cloud-sync.ts             cloud auth, v1/v2 orchestration and scheduling
+  lib/sync/engine.ts            v2 canonical import and durable outbox settlement
+  lib/sync/http.ts              v2 HTTP fallback and first migration
+  lib/sync/socket.ts            foreground WebSocket transport
+  lib/sync/outbox.ts            local mutation payload assembly
   lib/notifications.ts          native local notification scheduling
   lib/invoice.ts                document generation/sharing
   lib/settings-context.tsx
@@ -710,13 +778,16 @@ auth/modal layout prevents login inputs from remaining hidden behind the keyboar
 
 ### Local database
 
-Mobile SQLite contains clients, debts, installments, payments, and
-`sync_deletions`. Rows use local numeric IDs and gain nullable `server_id` plus
-timestamps through additive migrations.
+Mobile SQLite contains clients, debts, installments, payments, legacy
+`sync_deletions`, and v2 `sync_outbox`, `sync_row_changes`, `sync_context`, and
+`sync_state`. Rows keep local numeric IDs and gain server UUIDs, revisions,
+timestamps, debt references, and payment operation IDs through additive
+migrations.
 
 Schema upgrades call `addColumnIfMissing`; they do not drop and recreate the
 ledger. Partial unique indexes prevent duplicate non-null server UUIDs. Timestamp
-triggers fill or touch `updated_at` during writes.
+triggers fill or touch `updated_at` during writes. V2 triggers capture local
+changes inside `mutate()` and suppress captures during server imports.
 
 The phone implements local debt creation, client management, penalty handling,
 payments, reversals, settlement, invoice generation, and history queries. Changes
@@ -729,6 +800,9 @@ Settings renders `CloudMigrationCard`. A user can create a cloud account with
 name/email/password or sign into an existing account. Connecting stores the token
 and enables sync; disconnecting removes cloud credentials and pending auth state,
 but does not delete the phone ledger.
+On v2 the card shows Live, Reconnecting, Syncing, or Offline, pending changes,
+and a conflict inbox link. A client profile can share its public link after
+flushing pending local changes to the server.
 
 Cloud migration is disabled on Expo web because SecureStore/native behavior is the
 supported target. The desktop React application is the web product.
@@ -771,6 +845,10 @@ testing browser push:
 .\.venv\Scripts\python manage.py generate_vapid_keys
 ```
 
+For WebSocket testing, start a local Redis at `REDIS_URL` and serve
+`config.asgi:application` with Uvicorn instead of `runserver`. The release and
+multi-worker Redis gate still requires the operator's rollout environment.
+
 ### Web frontend
 
 ```powershell
@@ -810,23 +888,36 @@ npm run build
 cd "D:\ACODIGO\PINGO CORE\Dividas"
 npx tsc --noEmit
 npm run lint
+node --no-warnings scripts/test-v2-schema.mjs
+node --no-warnings scripts/test-v2-outbox.mjs
+node --no-warnings scripts/test-v2-socket.mjs
 ```
 
-At the last relevant checks, the backend had 16 passing tests; mobile TypeScript
-passed; mobile lint had no errors and pre-existing warnings; frontend build passed
-and lint reported warnings in generated/effect code but no blocking errors. Always
-use the new command output rather than relying on those historical results.
+At the last relevant checks, 81 backend ledger tests passed. Mobile TypeScript,
+lint, and the three Node SQLite/socket contract tests passed with eight existing
+lint warnings. Frontend lint/build passed with existing warnings. A release APK
+upgrade against an old `dividas_v3.db`, live Redis, two browser tabs, and phone
+network/background scenarios are still required before rollout. Always use new
+command output rather than these historical results.
 
 ### Required sync regression scenarios
+
+These scenarios cover v1 compatibility and shared ledger behavior; the v1 batch
+and tombstone checks (6–8) do not describe the v2 wire format. On v2, check
+foreground phone-to-web visibility within two seconds, same-account
+two-tab delivery, retry of one `mutationId` after a killed push, field merge,
+structural conflict inbox re-apply/discard, and non-destructive bootstrap after
+cursor expiry. The tests in `ledger/tests_sync_v2.py` and `ledger/tests_ws.py`
+cover protocol and isolation behavior; device runtime checks remain pending.
 
 1. Upgrade a database containing old offline rows; all rows remain visible.
 2. Register a new cloud account with phone data and an empty server; phone rows
    appear in cloud and remain on phone.
 3. Connect a phone with local data to an account that already has desktop data;
    both sets survive and appear on both sides.
-4. Create/edit a client or debt on desktop; foreground mobile pulls it within the
-   next successful 30-second cycle or immediately on refresh.
-5. Create/pay/edit/delete on mobile; desktop shows it after refresh.
+4. Create/edit a client or debt on desktop; v1 mobile pulls in its next cycle,
+   while foreground v2 mobile receives it over the socket.
+5. Create/pay/edit/delete on mobile; a live desktop tab refreshes from the feed.
 6. Delete a synchronized row offline, reconnect, and confirm the tombstone deletes
    it on the server without resurrection.
 7. Retry the same sync batch; no duplicate records appear.
@@ -835,8 +926,8 @@ use the new command output rather than relying on those historical results.
    no data.
 10. Fail the network during pull and upload; all local records and pending deletes
     remain intact.
-11. Concurrently edit the same row on desktop and mobile; verify and document the
-    expected last-write-wins result.
+11. Concurrently edit the same row on desktop and mobile; verify v1 row-level
+    last-write-wins or v2 field merge/conflict behavior, as appropriate.
 12. Verify totals after every multi, single-interest, principal, settle, and revert
     operation on both platforms.
 
@@ -853,7 +944,7 @@ use the new command output rather than relying on those historical results.
 
 ## 14. Production deployment
 
-### Current topology
+### Current deployed topology (before protocol v2 rollout)
 
 ```text
 Web:      https://pingo.rakei.co.za             Vercel
@@ -866,7 +957,28 @@ Database: /home/ubuntu/pingo-backend/db.sqlite3
 Port 8000 on the VPS was observed to belong to an unrelated Uvicorn process bound
 to `0.0.0.0:8000`. Pingo should use `127.0.0.1:8001` unless a fresh port inspection
 shows otherwise. PM2 showing "online" does not prove Gunicorn successfully owns its
-port; inspect logs and sockets.
+port; inspect logs and sockets. This document does not claim the new ASGI code
+has been deployed. Do not contact or alter the VPS from an implementation task.
+
+### Planned protocol v2 transition (human operator only)
+
+1. Back up `db.sqlite3` with a timestamp and verify the copy.
+2. Install Redis bound to `127.0.0.1:6379`, then set `REDIS_URL` in the VPS
+   environment. Keep `PINGO_MOBILE_V2_ENABLED=false` initially.
+3. Deploy the backend code, install `requirements.txt`, and run migrations.
+   Existing WSGI HTTP and v1 sync remain compatible while the change log fills.
+4. Replace only PM2's `pingo-api` command with
+   `.venv/bin/uvicorn config.asgi:application --host 127.0.0.1 --port 8001 --workers 2 --proxy-headers`.
+   Leave the unrelated service on port 8000 untouched. Verify local HTTP,
+   unauthenticated WebSocket 4401, and Cloudflare WebSocket proxying.
+5. Deploy the web client and check two same-account tabs and account isolation.
+6. Build a release APK, upgrade a copy of a real old `dividas_v3.db`, run the
+   sync scenarios, then enable `PINGO_MOBILE_V2_ENABLED=true` for a device-first
+   rollout. Monitor conflicts and socket counts before expanding access.
+
+To roll back the socket server, return `pingo-api` to Gunicorn/WSGI; v2 phones
+continue over HTTP v2 while the backend code stays deployed. Do not remove v1
+until the D5 compatibility window and all device gates have passed.
 
 The desired checkout layout has `manage.py` directly at:
 
@@ -877,7 +989,7 @@ The desired checkout layout has `manage.py` directly at:
 Do not leave a second nested clone such as
 `/home/ubuntu/pingo-backend/Pingo-backend/manage.py`.
 
-### First backend deployment
+### Legacy first backend deployment reference
 
 ```bash
 cd /home/ubuntu
@@ -913,7 +1025,7 @@ Run the command printed by `pm2 startup` once with sudo, then save again.
 `requirements.txt`. Adding it to production requirements would make deployments
 more reproducible.
 
-### Updating backend production
+### Updating backend production under the current WSGI process
 
 Back up first, then pull and migrate:
 
@@ -1035,20 +1147,23 @@ Push troubleshooting order:
 
 These are known boundaries, not instructions to rewrite the system immediately:
 
-1. Desktop freshness is manual after external changes. Add modest authenticated
-   polling or server events if live cross-device desktop updates become necessary.
-2. Sync is row-level last-write-wins and vulnerable to phone clock skew. A server
-   revision protocol would be more robust for multiple active devices.
+1. Live desktop and mobile code is implemented, but real Redis/ASGI, two browser
+   tabs, and a release APK have not passed runtime gates or been deployed yet.
+2. Legacy v1 remains row-level last-write-wins and depends on phone timestamps.
+   Protocol v2 uses server revisions and field merge, but its conflict inbox and
+   old-database upgrade still need release-device testing.
 3. Bootstrap and table pagination are client-side. Add server pagination when an
    account grows large.
-4. Reference generation can race under concurrent writers.
+4. Reference generation now uses a transaction-protected counter on SQLite;
+   keep the concurrent creation regression test if changing storage engines.
 5. SQLite limits backend write concurrency and needs disciplined backups.
 6. Password policy and token lifecycle are minimal.
 7. No server-originated native mobile push exists; current native reminders are
    local schedules.
 8. OS background sync timing is not guaranteed.
 9. The web lacks URL-per-page routing and route-level code splitting.
-10. Backend documentation outside this file has stale upload-only/hourly sync text.
+10. V1 endpoint and legacy tombstone/batch code remain for the D5 window. Their
+    retirement must follow rollout, not implementation alone.
 11. Mobile contains older theme/font infrastructure (including Manrope in drawer
     styling) even though the web design mandate is Inter/dark-only. Do not assume a
     web typography request automatically authorizes a mobile-wide restyle.
@@ -1060,9 +1175,10 @@ These are known boundaries, not instructions to rewrite the system immediately:
 
 1. Update the Django model and create a migration.
 2. Update serializers and bootstrap shape if web-visible.
-3. Update sync snapshot export, upload validation/upsert, and reconciliation.
+3. Update v1 snapshot compatibility and v2 `sync_log.py`/`sync_v2.py` wire fields,
+   mutation validation, and reconciliation.
 4. Add an additive mobile SQLite migration; never reset the phone DB.
-5. Update mobile export/import types and mappings.
+5. Update mobile v1 export/import and v2 outbox/engine mappings and triggers.
 6. Update forms, profiles, documents, CSV, and formatters where relevant.
 7. Add backend account-isolation and sync tests.
 8. Test upgrade using a copy of an old mobile database.
@@ -1088,15 +1204,16 @@ These are known boundaries, not instructions to rewrite the system immediately:
 
 ### Changing sync
 
-1. Preserve unsynced local rows on pull.
-2. Preserve tombstones until a successful canonical response.
+1. Preserve unsynced local rows on pull and bootstrap.
+2. Preserve v1 tombstones and v2 outbox entries until a successful response.
 3. Keep server UUID lookups owner-scoped.
 4. Keep device IDs account-bound.
-5. Maintain batch idempotency.
+5. Maintain v1 batch and v2 mutation idempotency.
 6. Import in dependency order: clients, debts, installments, payments.
 7. Delete in reverse dependency order.
 8. Recompute derived totals after relationships and deletions settle.
-9. Test failed requests, retries, first migration, and concurrent edits.
+9. Test failed requests, retries, first migration, concurrent edits, cursor
+   expiry, conflict resolution, and socket account isolation.
 
 ### Deploying
 
@@ -1176,14 +1293,16 @@ dropdown primitive.
 1. Confirm the phone is connected to the same email account.
 2. Confirm network reachability and API URL.
 3. Pull to refresh and inspect last attempt/success in Settings.
-4. Inspect Django logs for `/api/mobile/sync/`.
+4. On v1 inspect `/api/mobile/sync/`; on v2 inspect socket hello, then
+   `/api/sync/v2/changes/` and `/api/sync/v2/push/` fallback results.
 5. Verify the token has not been revoked and the device belongs to that user.
 6. Remember that the phone displays SQLite; it reloads after a successful import.
 
 ### Desktop does not see mobile data
 
-Confirm the mobile sync POST succeeded, then refresh the browser. The current web
-app does not automatically poll for another device's changes.
+Confirm the mobile push succeeded. In a live web tab, check the Live indicator,
+WebSocket handshake Origin, Redis health, and change cursor. The current WSGI
+deployment still needs a browser refresh until the ASGI/web rollout occurs.
 
 ## 20. Final orientation for the next maintainer
 
@@ -1192,9 +1311,10 @@ Start with these files in order:
 1. `backend/ledger/models.py` for the persisted domain.
 2. `backend/ledger/services.py` for the financial rules.
 3. `backend/ledger/views.py` and `serializers.py` for the web/API contract.
-4. `backend/ledger/mobile_sync.py` for cloud reconciliation.
+4. `backend/ledger/mobile_sync.py` for v1 compatibility; `sync_log.py`,
+   `sync_v2.py`, and `consumers.py` for v2.
 5. `Dividas/lib/database.ts` for offline behavior and phone schema.
-6. `Dividas/lib/cloud-sync.ts` for scheduling and transport.
+6. `Dividas/lib/cloud-sync.ts` and `lib/sync/` for scheduling and transport.
 7. `frontend/src/App.jsx` and `frontend/src/lib/api.js` for web state/auth.
 8. The relevant screen component for presentation and interactions.
 
