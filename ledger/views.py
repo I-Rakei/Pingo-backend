@@ -16,6 +16,7 @@ from .models import (Client, Debt, DocumentSequence, MobileDevice, OrganizationM
 from .mobile_sync import snapshot_for_user, sync_snapshot
 from .password_reset import reset_password, send_no_account_email, send_password_reset_email
 from .push import get_vapid_public_key, send_push_to_user
+from .sync_v2 import latest_cursor
 from .serializers import (AmortizationScheduleSerializer, BalanceNoteSerializer, ClientPublicSerializer,
                           ClientSerializer, ClientShareSerializer, CreditNoteSerializer, DebitNoteSerializer,
                           DebtCreateSerializer, DebtSerializer, DebtUpdateSerializer, DocumentCreateSerializer,
@@ -291,13 +292,19 @@ def preferences_view(request):
 def bootstrap_view(request):
     scope = resolve_scope(request.user)
     assess_overdue_penalties(scope)
+    # Read the feed position before the data: anything committed in between is
+    # replayed to the live socket, which only causes a harmless extra refresh.
+    sync_cursor = latest_cursor(request.user)
     clients = Client.objects.filter(**scope)
     debts = Debt.objects.filter(**scope).select_related("client").prefetch_related("installments")
     payments = Payment.objects.filter(reversed_at__isnull=True, **scope).select_related("debt", "client", "installment")
     membership = get_membership(request.user)
-    organization = {"name": membership.organization.name, "role": membership.role} if membership else None
+    organization = None
+    if membership:
+        org = membership.organization
+        organization = {"name": org.name, "role": membership.role, "nuit": org.nuit, "address": org.address}
     return Response({"user": UserSerializer(request.user).data, "settings": PreferenceSerializer(preference_for(request.user)).data,
-                     "organization": organization,
+                     "organization": organization, "syncCursor": sync_cursor,
                      "clients": ClientSerializer(clients, many=True).data, "debts": DebtSerializer(debts, many=True).data,
                      "payments": PaymentSerializer(payments, many=True).data})
 

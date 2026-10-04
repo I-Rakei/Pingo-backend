@@ -137,6 +137,8 @@ def remember_old_fields(sender, instance, **kwargs):
 @receiver(pre_delete, sender=Installment)
 def remember_installment_scope(sender, instance, origin=None, **kwargs):
     instance._sync_scope_ids = scope_ids(instance)
+    # Kept on the tombstone so structural-conflict checks can find deleted periods.
+    instance._sync_debt_public_id = str(instance.debt.public_id)
     # SET_NULL cascades use QuerySet.update() internally and skip Payment's
     # signals. Make that relationship change explicit for a direct period
     # delete. A debt cascade deletes those payments, so only tombstones matter.
@@ -172,7 +174,8 @@ def append_saved_change(sender, instance, created, **kwargs):
 def append_deleted_change(sender, instance, **kwargs):
     scope = getattr(instance, "_sync_scope_ids", None) or scope_ids(instance)
     device, mutation = _origin.get()
+    debt_id = getattr(instance, "_sync_debt_public_id", None)
     change = SyncChange.objects.create(**scope, entity=SYNC_MODELS[sender], entity_id=instance.public_id,
-                                       op="delete", fields={}, changed_fields=[],
+                                       op="delete", fields={"debtId": debt_id} if debt_id else {}, changed_fields=[],
                                        origin_device=device, mutation=mutation)
     transaction.on_commit(lambda: notify_scope(scope, change.pk, change.pk))

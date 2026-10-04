@@ -428,16 +428,25 @@ class ClientShareApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["name"], "Ana")
         self.assertEqual(len(response.data["debts"]), 1)
-        self.assertEqual(response.data["debts"][0]["id"], "PNG-5001")
-        self.assertEqual(Decimal(str(response.data["debts"][0]["outstanding"])), Decimal("55.00"))
-        self.assertEqual(len(response.data["payments"]), 1)
-        self.assertEqual(Decimal(str(response.data["payments"][0]["amount"])), Decimal("55.00"))
+        debt = response.data["debts"][0]
+        self.assertEqual(debt["id"], "PNG-5001")
+        # Only capital, interest and their total, plus what was paid and what is due.
+        self.assertEqual({key: Decimal(str(debt[key])) for key in ("capital", "interest", "total", "paid", "due")},
+                         {"capital": Decimal("100"), "interest": Decimal("10"), "total": Decimal("110"),
+                          "paid": Decimal("55"), "due": Decimal("55")})
+        self.assertEqual(len(response.data["paymentsMade"]), 1)
+        self.assertEqual(Decimal(str(response.data["paymentsMade"][0]["amount"])), Decimal("55.00"))
+        self.assertEqual([(item["number"], Decimal(str(item["amount"]))) for item in response.data["paymentsDue"]],
+                         [(1, Decimal("55"))])
+        self.assertEqual(Decimal(str(response.data["summary"]["total"])), Decimal("110"))
 
-        # Private/owner-only fields must never appear in the public payload.
+        # Private/owner-only and internal ledger fields never appear in the public payload.
         payload_text = str(response.data)
         self.assertNotIn("private note", payload_text)
         self.assertNotIn("+258 84", payload_text)
         self.assertNotIn("owner", response.data)
+        for hidden in ("outstanding", "collected", "interestRate", "installments"):
+            self.assertNotIn(hidden, debt)
 
     def test_public_endpoint_hides_reversed_payments_and_unknown_token(self):
         self.payment.reversed_at = timezone.now()
@@ -447,7 +456,7 @@ class ClientShareApiTests(TestCase):
 
         anonymous = APIClient()
         response = anonymous.get(f"/api/public/clients/{token}/")
-        self.assertEqual(response.data["payments"], [])
+        self.assertEqual(response.data["paymentsMade"], [])
 
         missing = anonymous.get("/api/public/clients/not-a-real-token/")
         self.assertEqual(missing.status_code, 404)

@@ -46,21 +46,18 @@ class LedgerSocketTests(TransactionTestCase):
         self.assertEqual(welcome["type"], "welcome")
         return device_id
 
+    async def assert_refused(self, socket, code):
+        # Refusals are accepted then closed, so real clients receive the code
+        # instead of a bare HTTP 403 (which they report as 1006).
+        connected, _ = await socket.connect()
+        self.assertTrue(connected)
+        closed = await socket.receive_output(timeout=2)
+        self.assertEqual((closed["type"], closed["code"]), ("websocket.close", code))
+
     async def test_handshake_and_device_binding(self):
-        anonymous = self.socket(origin="http://localhost:5173")
-        connected, code = await anonymous.connect()
-        self.assertFalse(connected)
-        self.assertEqual(code, 4401)
-
-        bad_origin = self.socket(origin="https://evil.example")
-        connected, code = await bad_origin.connect()
-        self.assertFalse(connected)
-        self.assertEqual(code, 4401)
-
-        invalid_token = self.socket(token=type("T", (), {"key": "bad"})())
-        connected, code = await invalid_token.connect()
-        self.assertFalse(connected)
-        self.assertEqual(code, 4401)
+        await self.assert_refused(self.socket(origin="http://localhost:5173"), 4401)
+        await self.assert_refused(self.socket(origin="https://evil.example"), 4403)
+        await self.assert_refused(self.socket(token=type("T", (), {"key": "bad"})()), 4401)
 
         a = self.socket(token=self.token)
         connected, _ = await a.connect()
@@ -138,7 +135,7 @@ class LedgerSocketTests(TransactionTestCase):
             self.assertTrue((await socket.connect())[0])
             await self.hello(socket)
         sixth = self.socket(token=self.token)
-        self.assertEqual(await sixth.connect(), (False, 4429))
+        await self.assert_refused(sixth, 4429)
 
         # Every one of five connections sees every one of 100 committed writes.
         # Sequential writes keep the SQLite transaction model realistic.
@@ -164,3 +161,6 @@ class LedgerSocketTests(TransactionTestCase):
             page = await tab.receive_json_from(timeout=2)
             self.assertEqual(page["items"][0]["id"], str(client.public_id))
             await tab.disconnect()
+        # Browser tabs read the feed only, so they leave no device records behind.
+        from .models import MobileDevice
+        self.assertFalse(await database_sync_to_async(MobileDevice.objects.filter(owner=self.user).exists)())

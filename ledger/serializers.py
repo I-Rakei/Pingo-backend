@@ -192,60 +192,60 @@ class ClientShareSerializer(serializers.Serializer):
         return f"{base}/?share={client.share_token}"
 
 
-class ClientPublicInstallmentSerializer(serializers.ModelSerializer):
-    dueDate = serializers.DateField(source="due_date")
-    paidAmount = serializers.DecimalField(source="paid_amount", max_digits=14, decimal_places=2)
+def _public_debt_statement(debt, payments):
+    """Capital, interest and total for one debt, plus what is still due.
 
-    class Meta:
-        model = Installment
-        fields = ["number", "dueDate", "amount", "paidAmount"]
-
-
-class ClientPublicPaymentSerializer(serializers.ModelSerializer):
-    debtId = serializers.CharField(source="debt.reference", read_only=True)
-    type = serializers.CharField(source="payment_type", read_only=True)
-    date = serializers.DateField(source="payment_date", read_only=True)
-
-    class Meta:
-        model = Payment
-        fields = ["debtId", "amount", "type", "date"]
-
-
-class ClientPublicDebtSerializer(serializers.ModelSerializer):
-    id = serializers.CharField(source="reference", read_only=True)
-    type = serializers.SerializerMethodField()
-    loanType = serializers.CharField(source="loan_type")
-    status = serializers.SerializerMethodField()
-    dueDate = serializers.DateField(source="due_date")
-    installments = ClientPublicInstallmentSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Debt
-        fields = ["id", "type", "loanType", "total", "outstanding", "collected", "status", "dueDate", "installments"]
-
-    def get_type(self, obj):
-        return "Multi-period" if obj.loan_type == Debt.LoanType.MULTI else "Single loan"
-
-    def get_status(self, obj):
-        return obj.current_status
+    Interest is every charge on top of the capital (contractual interest and
+    any overdue penalties), so total = capital + interest = paid + due."""
+    zero = Decimal("0")
+    periods = list(debt.installments.all())
+    capital = debt.principal
+    charged = sum((item.amount for item in periods), zero)
+    interest = max(charged - capital, zero) if debt.loan_type == Debt.LoanType.MULTI else charged
+    due = []
+    for item in periods:
+        remaining = item.amount - item.paid_amount
+        if remaining > 0:
+            kind = "installment" if debt.loan_type == Debt.LoanType.MULTI else "interest"
+            due.append({"debtId": debt.reference, "kind": kind, "number": item.number,
+                        "dueDate": item.due_date, "amount": remaining})
+    if debt.loan_type == Debt.LoanType.SINGLE and debt.capital_remaining > 0:
+        due.append({"debtId": debt.reference, "kind": "capital", "number": None,
+                    "dueDate": debt.due_date, "amount": debt.capital_remaining})
+    paid = sum((payment.amount for payment in payments), zero)
+    summary = {"id": debt.reference, "status": debt.current_status, "dueDate": debt.due_date,
+               "capital": capital, "interest": interest, "total": capital + interest,
+               "paid": paid, "due": sum((item["amount"] for item in due), zero)}
+    return summary, due
 
 
 class ClientPublicSerializer(serializers.Serializer):
     """Read-only, unauthenticated payload for a client's own share link.
-    Deliberately excludes phone/email/address/notes and anything belonging to
-    another client or the owner's account."""
 
-    name = serializers.CharField()
-    debts = serializers.SerializerMethodField()
-    payments = serializers.SerializerMethodField()
+    Shows only capital, interest and total per debt, the payments made, and the
+    payments still due. Deliberately excludes phone/email/address/notes, rates,
+    internal ledger fields, and anything belonging to another client or the
+    owner's account."""
 
-    def get_debts(self, client):
-        debts = client.debts.prefetch_related("installments")
-        return ClientPublicDebtSerializer(debts, many=True).data
-
-    def get_payments(self, client):
-        payments = client.payments.filter(reversed_at__isnull=True).select_related("debt").order_by("-payment_date")
-        return ClientPublicPaymentSerializer(payments, many=True).data
+    def to_representation(self, client):
+        payments = list(client.payments.filter(reversed_at__isnull=True)
+                        .select_related("debt").order_by("-payment_date", "-created_at"))
+        debts, payments_due = [], []
+        for debt in client.debts.prefetch_related("installments").order_by("-created_at"):
+            summary, due = _public_debt_statement(debt, [item for item in payments if item.debt_id == debt.pk])
+            debts.append(summary)
+            payments_due.extend(due)
+        payments_due.sort(key=lambda item: item["dueDate"])
+        zero = Decimal("0")
+        totals = {key: sum((item[key] for item in debts), zero) for key in ("capital", "interest", "total", "paid", "due")}
+        return {
+            "name": client.name,
+            "summary": totals,
+            "debts": debts,
+            "paymentsMade": [{"debtId": item.debt.reference, "date": item.payment_date,
+                              "amount": item.amount, "type": item.payment_type} for item in payments],
+            "paymentsDue": payments_due,
+        }
 
 
 class PreferenceSerializer(serializers.ModelSerializer):

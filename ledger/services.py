@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.contrib.auth.models import User
 from django.db import IntegrityError, transaction
+from django.db.models import Exists, F, OuterRef, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -163,11 +164,21 @@ def reconcile_debt(debt, *, today=None):
 
 
 def assess_overdue_penalties(scope=None, *, today=None):
+    """Reconcile only the debts whose day-dependent values are now stale.
+
+    This runs on reads (bootstrap, dashboard, sync hello), so it must not touch
+    every debt: only open debts that just passed their due date, or that have an
+    overdue, unpaid period still waiting for its one-time penalty. All other
+    balances are already reconciled on every write."""
     today = today or timezone.localdate()
-    debts = Debt.objects.filter(installments__due_date__lt=today)
+    unpenalised = Installment.objects.filter(debt=OuterRef("pk"), due_date__lt=today,
+                                             paid_amount__lt=F("amount"), penalty_amount=0)
+    debts = Debt.objects.filter(outstanding__gt=0).filter(
+        (Q(due_date__lt=today) & ~Q(status=Debt.Status.OVERDUE))
+        | (Q(penalty_rate__gt=0) & Exists(unpenalised)))
     if scope:
         debts = debts.filter(**scope)
-    for debt in debts.distinct().iterator():
+    for debt in debts.iterator():
         reconcile_debt(debt, today=today)
 
 

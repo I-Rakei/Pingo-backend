@@ -47,7 +47,14 @@ def changes_view(request):
 def push_view(request):
     _check_mobile_scope(request)
     device = require_device(request.user, _device_id(request))
-    return Response(apply_mutation(request.user, device, request.data))
+    payload = request.data if isinstance(request.data, dict) else {}
+    try:
+        return Response(apply_mutation(request.user, device, payload))
+    except ValidationError:
+        # Same reply as the socket. An HTTP 400 here would make the phone retry
+        # this malformed entry forever and block every change queued after it.
+        return Response({"type": "push_result", "mutationId": payload.get("mutationId"),
+                         "status": "rejected", "error": "invalid_push"})
 
 
 @api_view(["GET"])

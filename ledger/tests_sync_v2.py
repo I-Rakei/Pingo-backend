@@ -382,3 +382,104 @@ class ReferenceConcurrencyTests(TransactionTestCase):
             references = list(pool.map(create, range(6)))
         self.assertEqual(len(set(references)), 6)
         self.assertEqual(Debt.objects.filter(owner=user).count(), 6)
+
+
+class AuditFixTests(TestCase):
+    """Regression tests for the 2026-10-04 audit of the v2 sync."""
+
+    # Reuse the fixtures without re-running every SyncV2Tests test.
+    setUp = SyncV2Tests.setUp
+    make_client = SyncV2Tests.make_client
+    debt = SyncV2Tests.debt
+    push = SyncV2Tests.push
+
+    def single_loan_overdue_in(self, days):
+        client = self.make_client()
+        return create_debt(self.user, {"clientId": client.pk, "loanType": "single",
+            "principal": Decimal("100.00"), "interestRate": Decimal("10.00"), "penaltyRate": 0,
+            "durationMonths": 1, "startDate": timezone.localdate() - timedelta(days=40),
+            "dueDate": timezone.localdate() + timedelta(days=days)})
+
+    def interest_rollover(self, debt, base):
+        current = debt.installments.get(number=1)
+        due = (timezone.localdate() + timedelta(days=35)).isoformat()
+        return [
+            {"entity": "debt", "id": str(debt.public_id), "op": "update", "baseRevision": base,
+             "changedFields": {"dueDate": due}},
+            {"entity": "installment", "id": str(uuid.uuid4()), "op": "insert", "debtBaseRevision": base,
+             "fields": {"debtId": str(debt.public_id), "number": 2, "dueDate": due, "baseAmount": "10.00"}},
+            {"entity": "payment", "id": str(uuid.uuid4()), "op": "insert", "fields": {
+             "debtId": str(debt.public_id), "installmentId": str(current.public_id),
+             "operationId": str(uuid.uuid4()), "amount": "10.00", "type": "interest",
+             "date": timezone.localdate().isoformat(), "note": ""}},
+        ]
+
+    def test_same_device_queued_actions_on_one_loan_do_not_conflict(self):
+        debt = self.single_loan_overdue_in(5)
+        base = debt.revision  # both actions were captured offline against this revision
+        _, first = self.push(self.device_a, self.interest_rollover(debt, base), action="paySingleLoanInterest")
+        self.assertEqual(first["status"], "applied", first)
+        _, second = self.push(self.device_a, [
+            {"entity": "debt", "id": str(debt.public_id), "op": "update", "baseRevision": base,
+             "debtBaseRevision": base, "changedFields": {"capitalRemaining": "80.00"}},
+            {"entity": "payment", "id": str(uuid.uuid4()), "op": "insert", "fields": {
+             "debtId": str(debt.public_id), "installmentId": None, "operationId": str(uuid.uuid4()),
+             "amount": "20.00", "type": "principal", "date": timezone.localdate().isoformat(), "note": ""}},
+        ], action="paySingleLoanPrincipal")
+        self.assertEqual(second["status"], "applied", second)
+        debt.refresh_from_db()
+        self.assertEqual((debt.capital_remaining, debt.installments.count()), (Decimal("80.00"), 2))
+
+    def test_derived_overdue_assessment_does_not_conflict_offline_payment(self):
+        debt = self.single_loan_overdue_in(5)
+        base = debt.revision
+        past = timezone.localdate() - timedelta(days=1)
+        Debt.objects.filter(pk=debt.pk).update(due_date=past)
+        Installment.objects.filter(debt=debt).update(due_date=past)
+        self.api.get("/api/bootstrap/")  # a read flips the stored status to overdue
+        debt.refresh_from_db()
+        self.assertEqual(debt.status, Debt.Status.OVERDUE)
+        self.assertGreater(debt.revision, base)
+        _, result = self.push(self.device_a, self.interest_rollover(debt, base), action="paySingleLoanInterest")
+        self.assertEqual(result["status"], "applied", result)
+
+    def test_another_writers_new_period_still_conflicts(self):
+        debt = self.single_loan_overdue_in(5)
+        base = debt.revision
+        record_payment(self.user, debt.reference, {"action": "interest"})  # web pays interest: new period
+        _, result = self.push(self.device_a, self.interest_rollover(debt, base), action="paySingleLoanInterest")
+        self.assertEqual((result["status"], result["conflicts"][0]["reason"]), ("conflict", "stale_base_revision"))
+        self.assertEqual(debt.installments.count(), 2)
+
+    def test_malformed_http_push_is_rejected_not_retried_forever(self):
+        device_id = str(uuid.uuid4())
+        self.api.post("/api/sync/v2/hello/", {"type": "hello", "v": 2, "app": "mobile", "schemaVersion": 4,
+                                              "deviceId": device_id, "cursor": 0}, format="json")
+        mutation_id = str(uuid.uuid4())
+        response = self.api.post(f"/api/sync/v2/push/?deviceId={device_id}",
+                                 {"type": "push", "mutationId": mutation_id, "changes": []}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((response.data["status"], response.data["mutationId"]), ("rejected", mutation_id))
+
+    def test_reads_only_reconcile_debts_with_stale_day_values(self):
+        settled = self.debt()
+        record_payment(self.user, settled.reference, {"action": "balance", "amount": "110.00"})
+        Installment.objects.filter(debt=settled).update(due_date=timezone.localdate() - timedelta(days=10))
+        before = SyncChange.objects.count()
+        response = self.api.get("/api/bootstrap/")
+        self.assertEqual(SyncChange.objects.count(), before)  # paid debts are never rewritten on read
+        self.assertEqual(response.data["syncCursor"], latest_cursor(self.user))
+
+    def test_reconcile_report_is_read_only_unless_applied(self):
+        from io import StringIO
+        debt = self.debt()
+        Debt.objects.filter(pk=debt.pk).update(outstanding=Decimal("1.00"))
+        out = StringIO()
+        call_command("reconcile_report", stdout=out)
+        self.assertIn(debt.reference, out.getvalue())
+        self.assertIn("Would update 1 of", out.getvalue())
+        debt.refresh_from_db()
+        self.assertEqual(debt.outstanding, Decimal("1.00"))
+        call_command("reconcile_report", "--apply", stdout=StringIO())
+        debt.refresh_from_db()
+        self.assertEqual(debt.outstanding, Decimal("110.00"))

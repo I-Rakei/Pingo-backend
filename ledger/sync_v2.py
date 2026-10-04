@@ -128,7 +128,11 @@ def welcome(user, payload):
     app = payload.get("app", "mobile")
     if app == "mobile" and payload.get("schemaVersion") != 4:
         raise ValidationError({"schemaVersion": "Schema version 4 is required."})
-    device = bind_device(user, payload.get("deviceId"), payload.get("deviceLabel", ""), app=app)
+    if app not in {"mobile", "web"}:
+        raise ValidationError({"app": "Unsupported client."})
+    # Browser tabs only read the feed and never push, so they need no device
+    # record (and a shared browser can't trip the one-account-per-device rule).
+    device = None if app == "web" else bind_device(user, payload.get("deviceId"), payload.get("deviceLabel", ""), app=app)
     assess_overdue_penalties(_scope_filter(user))
     cursor = _cursor(payload.get("cursor", 0))
     return device, {"type": "welcome", "v": 2, "serverTime": timezone.now().isoformat(),
@@ -186,12 +190,31 @@ def _conflicting_fields(entity, row_id, base_revision, requested, scope):
     return sorted(changed.intersection(requested))
 
 
-def _parent_revision(change, debt, base_revisions):
+DEBT_STRUCTURAL_FIELDS = {"dueDate", "capitalRemaining", "principal", "interestRate", "loanType", "durationMonths", "startDate"}
+INSTALLMENT_STRUCTURAL_FIELDS = {"number", "dueDate", "baseAmount"}
+
+
+def _structure_changed_since(debt, base, device):
+    """True when another writer changed the debt's period structure after `base`.
+
+    Derived values (status, totals, collected, penalties, paid amounts) change on
+    every payment and on overdue assessment, so they never count. The device's
+    own earlier changes don't count either: its later queued actions were
+    computed on top of them."""
+    later = SyncChange.objects.filter(pk__gt=base).exclude(origin_device=device)
+    for op, changed in later.filter(entity="debt", entity_id=debt.public_id).values_list("op", "changed_fields"):
+        if op == "delete" or DEBT_STRUCTURAL_FIELDS.intersection(changed):
+            return True
+    periods = later.filter(entity="installment", fields__debtId=str(debt.public_id))
+    for op, changed in periods.values_list("op", "changed_fields"):
+        if op == "delete" or INSTALLMENT_STRUCTURAL_FIELDS.intersection(changed):
+            return True
+    return False
+
+
+def _parent_revision(change, debt, device):
     value = change.get("debtBaseRevision", change.get("baseRevision"))
-    # A grouped mobile action may update the debt before inserting its next
-    # period. Every structural row compares with the revision at group start.
-    initial = base_revisions.setdefault(debt.pk, debt.revision)
-    if value is None or _cursor(value) != initial:
+    if value is None or _structure_changed_since(debt, _cursor(value), device):
         raise SyncApplyError("stale_base_revision", "debt", debt.public_id, canonical_row(debt))
 
 
@@ -213,7 +236,7 @@ def _same_insert(entity, row, fields):
     return True
 
 
-def _apply_one(user, device, change, scope, touched_debts, created_debts, touched, notices, base_revisions):
+def _apply_one(user, device, change, scope, touched_debts, created_debts, touched, notices):
     entity, op = change.get("entity"), change.get("op")
     if entity not in MODELS or op not in {"insert", "update", "delete"}:
         raise SyncApplyError("bad_change", rejected=True)
@@ -260,7 +283,7 @@ def _apply_one(user, device, change, scope, touched_debts, created_debts, touche
         elif entity == "installment":
             debt = _get("debt", _uuid(fields.get("debtId")), scope)
             if debt.pk not in created_debts:
-                _parent_revision(change, debt, base_revisions)
+                _parent_revision(change, debt, device)
             base = _amount(fields.get("baseAmount"))
             row = Installment.objects.create(public_id=row_id, debt=debt, number=int(fields.get("number")),
                                              due_date=_date(fields.get("dueDate")), base_amount=base, amount=base)
@@ -288,12 +311,11 @@ def _apply_one(user, device, change, scope, touched_debts, created_debts, touche
                 setattr(row, CLIENT_FIELDS[key], str(value or ""))
             row.save(update_fields=[*(CLIENT_FIELDS[key] for key in fields), "updated_at"])
         elif entity == "debt":
-            base_revisions.setdefault(row.pk, row.revision)
             structural = set(fields) - set(DEBT_FIELDS) - {"capitalRemaining"}
             if structural:
                 raise SyncApplyError("read_only_field", entity, row_id, rejected=True)
             if "capitalRemaining" in fields:
-                _parent_revision(change, row, base_revisions)
+                _parent_revision(change, row, device)
             for key in _conflicting_fields(entity, row_id, change.get("baseRevision"), set(fields) & set(DEBT_FIELDS), scope):
                 notices.append({"entity": entity, "id": str(row_id), "reason": "field_overwritten", "field": key})
             update_fields = []
@@ -315,7 +337,7 @@ def _apply_one(user, device, change, scope, touched_debts, created_debts, touche
                         payment.save(update_fields=["client", "updated_at"])
             touched_debts.add(row.pk)
         elif entity == "installment":
-            _parent_revision(change, row.debt, base_revisions)
+            _parent_revision(change, row.debt, device)
             if not set(fields).issubset({"number", "dueDate", "baseAmount"}):
                 raise SyncApplyError("read_only_field", entity, row_id, rejected=True)
             if "number" in fields:
@@ -343,7 +365,7 @@ def _apply_one(user, device, change, scope, touched_debts, created_debts, touche
         if entity == "client" and (row.debts.exists() or row.payments.exists()):
             raise SyncApplyError("has_dependents", entity, row_id, canonical_row(row))
         if entity in {"debt", "installment"}:
-            _parent_revision(change, row if entity == "debt" else row.debt, base_revisions)
+            _parent_revision(change, row if entity == "debt" else row.debt, device)
         if entity == "payment":
             if row.reversed_at is None:
                 row.reversed_at = timezone.now()
@@ -381,7 +403,6 @@ def apply_mutation(user, device, payload):
                                          action=str(payload.get("action") or "")[:32], status="applied")
     scope = _scope_filter(user)
     touched, touched_debts, created_debts, notices, overpaid = [], set(), set(), [], []
-    base_revisions = {}
     changes = payload["changes"]
     if len(changes) > 100:
         raise ValidationError({"changes": "At most 100 row changes are allowed."})
@@ -395,7 +416,7 @@ def apply_mutation(user, device, payload):
             with sync_origin(device, record):
                 applied_any = False
                 for change in ordered:
-                    applied_any = _apply_one(user, device, change, scope, touched_debts, created_debts, touched, notices, base_revisions) or applied_any
+                    applied_any = _apply_one(user, device, change, scope, touched_debts, created_debts, touched, notices) or applied_any
                 for debt_id in created_debts:
                     if not Installment.objects.filter(debt_id=debt_id).exists():
                         debt = Debt.objects.get(pk=debt_id)

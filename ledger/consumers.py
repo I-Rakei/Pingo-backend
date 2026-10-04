@@ -50,6 +50,7 @@ def touch_socket(user_id):
 class LedgerConsumer(AsyncJsonWebsocketConsumer):
     async def connect(self):
         self.bound_device = None
+        self.hello_done = False
         self.sent_cursor = None
         self.last_ack = 0
         self.push_times = deque()
@@ -59,12 +60,12 @@ class LedgerConsumer(AsyncJsonWebsocketConsumer):
         self.reserved = False
         user = self.scope.get("user")
         if not user or not user.is_authenticated or not user.is_active:
-            await self.close(code=4401)
+            await self._refuse(4401)
             return
         try:
             self.reserved = await reserve_socket(user.pk)
             if not self.reserved:
-                await self.close(code=4429)
+                await self._refuse(4429)
                 return
             self.ledger_group = await socket_group(user)
             self.auth_group = f"auth.user.{user.pk}"
@@ -74,9 +75,15 @@ class LedgerConsumer(AsyncJsonWebsocketConsumer):
             if self.reserved:
                 await release_socket(user.pk)
                 self.reserved = False
-            await self.close(code=1013)
+            await self._refuse(1013)
             return
         await self.accept()
+
+    async def _refuse(self, code):
+        # A close sent before accept becomes an HTTP 403, and real clients only
+        # see code 1006. Accepting first lets apps act on the actual reason.
+        await self.accept()
+        await self.close(code=code)
 
     async def disconnect(self, code):
         if self.push_task is not None:
@@ -105,7 +112,7 @@ class LedgerConsumer(AsyncJsonWebsocketConsumer):
             await touch_socket(self.scope["user"].pk)
             await self.send_json({"type": "pong"})
         elif kind == "hello":
-            if self.bound_device is not None:
+            if self.hello_done:
                 await self.send_json({"type": "error", "reason": "already_bound"})
                 return
             try:
@@ -119,13 +126,14 @@ class LedgerConsumer(AsyncJsonWebsocketConsumer):
                     await self.send_json({"type": "error", "reason": "invalid_hello"})
                 return
             self.bound_device = device
+            self.hello_done = True
             await self.send_json(response)
             if response["resyncRequired"]:
                 await self.send_json({"type": "resync_required", "reason": "cursor_expired"})
             else:
                 self.sent_cursor = int(content.get("cursor", 0))
                 await self._drain()
-        elif kind == "ack" and self.bound_device is not None:
+        elif kind == "ack" and self.hello_done:
             try:
                 cursor = int(content.get("cursor"))
             except (ValueError, TypeError):
@@ -146,7 +154,7 @@ class LedgerConsumer(AsyncJsonWebsocketConsumer):
             self.push_busy = True
             self.push_task = asyncio.create_task(self._apply_push(content))
         else:
-            await self.send_json({"type": "error", "reason": "hello_required" if self.bound_device is None else "unknown_type"})
+            await self.send_json({"type": "error", "reason": "hello_required" if not self.hello_done else "unknown_type"})
 
     async def _apply_push(self, content):
         try:
