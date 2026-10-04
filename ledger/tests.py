@@ -430,15 +430,16 @@ class ClientShareApiTests(TestCase):
         self.assertEqual(len(response.data["debts"]), 1)
         debt = response.data["debts"][0]
         self.assertEqual(debt["id"], "PNG-5001")
-        # Only capital, interest and their total, plus what was paid and what is due.
-        self.assertEqual({key: Decimal(str(debt[key])) for key in ("capital", "interest", "total", "paid", "due")},
-                         {"capital": Decimal("100"), "interest": Decimal("10"), "total": Decimal("110"),
-                          "paid": Decimal("55"), "due": Decimal("55")})
+        # Only what is owed now: half of the 110 instalment is unpaid, split in
+        # the loan's 100:10 capital-to-interest ratio.
+        self.assertEqual({key: Decimal(str(debt[key])) for key in ("capital", "interest", "total")},
+                         {"capital": Decimal("50"), "interest": Decimal("5"), "total": Decimal("55")})
+        self.assertNotIn("paid", debt)
         self.assertEqual(len(response.data["paymentsMade"]), 1)
         self.assertEqual(Decimal(str(response.data["paymentsMade"][0]["amount"])), Decimal("55.00"))
         self.assertEqual([(item["number"], Decimal(str(item["amount"]))) for item in response.data["paymentsDue"]],
                          [(1, Decimal("55"))])
-        self.assertEqual(Decimal(str(response.data["summary"]["total"])), Decimal("110"))
+        self.assertEqual(Decimal(str(response.data["summary"]["total"])), Decimal("55"))
 
         # Private/owner-only and internal ledger fields never appear in the public payload.
         payload_text = str(response.data)
@@ -460,6 +461,30 @@ class ClientShareApiTests(TestCase):
 
         missing = anonymous.get("/api/public/clients/not-a-real-token/")
         self.assertEqual(missing.status_code, 404)
+
+    def test_public_statement_shows_only_what_is_owed_now(self):
+        # Single loan: capital 3700, interest period 1 (1110) paid, period 2 (1110) open.
+        single = Debt.objects.create(
+            owner=self.user, client=self.client_obj, reference="PNG-5010", loan_type=Debt.LoanType.SINGLE,
+            principal=Decimal("3700"), capital_remaining=Decimal("3700"), interest_rate=Decimal("30"),
+            duration_months=1, total=Decimal("4810"), outstanding=Decimal("4810"), collected=Decimal("1110"),
+            start_date=timezone.localdate(), due_date=timezone.localdate() + timedelta(days=30),
+        )
+        single.installments.create(number=1, due_date=timezone.localdate(), amount=Decimal("1110"), paid_amount=Decimal("1110"))
+        single.installments.create(number=2, due_date=single.due_date, amount=Decimal("1110"))
+        paid = Debt.objects.create(
+            owner=self.user, client=self.client_obj, reference="PNG-5011", loan_type=Debt.LoanType.MULTI,
+            principal=Decimal("300"), capital_remaining=Decimal("300"), interest_rate=Decimal("0"),
+            duration_months=1, total=Decimal("300"), outstanding=Decimal("0"), collected=Decimal("300"),
+            start_date=timezone.localdate(), due_date=timezone.localdate(),
+        )
+        paid.installments.create(number=1, due_date=paid.due_date, amount=Decimal("300"), paid_amount=Decimal("300"))
+        token = self.api.post(f"/api/clients/{self.client_obj.pk}/share/", {}, format="json").data["shareToken"]
+        data = APIClient().get(f"/api/public/clients/{token}/").data
+        debts = {item["id"]: item for item in data["debts"]}
+        self.assertNotIn("PNG-5011", debts)  # fully paid debts are not listed
+        self.assertEqual({key: Decimal(str(debts["PNG-5010"][key])) for key in ("capital", "interest", "total")},
+                         {"capital": Decimal("3700"), "interest": Decimal("1110"), "total": Decimal("4810")})
 
     def test_public_endpoint_never_exposes_another_clients_data(self):
         other_client = Client.objects.create(owner=self.other, name="Carlos")

@@ -192,38 +192,54 @@ class ClientShareSerializer(serializers.Serializer):
         return f"{base}/?share={client.share_token}"
 
 
-def _public_debt_statement(debt, payments):
-    """Capital, interest and total for one debt, plus what is still due.
+def _public_debt_statement(debt):
+    """What the client owes on one debt right now, split into capital and interest.
 
-    Interest is every charge on top of the capital (contractual interest and
-    any overdue penalties), so total = capital + interest = paid + due."""
+    Only open amounts count: paid periods and repaid capital are left out, so
+    total = capital + interest = everything still due. Single loans keep
+    capital apart from their interest periods. Multi-period instalments mix
+    both, so each instalment's unpaid base is split in the loan's own
+    capital-to-interest ratio, and any overdue penalty counts as interest."""
+    from .services import money
+
     zero = Decimal("0")
     periods = list(debt.installments.all())
-    capital = debt.principal
-    charged = sum((item.amount for item in periods), zero)
-    interest = max(charged - capital, zero) if debt.loan_type == Debt.LoanType.MULTI else charged
     due = []
+    capital = zero
+    open_total = zero
+    if debt.loan_type == Debt.LoanType.MULTI:
+        bases = sum(((item.base_amount or item.amount - item.penalty_amount) for item in periods), zero)
+        ratio = (debt.principal / bases) if bases > 0 else Decimal("1")
     for item in periods:
-        remaining = item.amount - item.paid_amount
-        if remaining > 0:
-            kind = "installment" if debt.loan_type == Debt.LoanType.MULTI else "interest"
-            due.append({"debtId": debt.reference, "kind": kind, "number": item.number,
-                        "dueDate": item.due_date, "amount": remaining})
-    if debt.loan_type == Debt.LoanType.SINGLE and debt.capital_remaining > 0:
-        due.append({"debtId": debt.reference, "kind": "capital", "number": None,
-                    "dueDate": debt.due_date, "amount": debt.capital_remaining})
-    paid = sum((payment.amount for payment in payments), zero)
+        remaining = max(item.amount - item.paid_amount, zero)
+        if remaining <= 0:
+            continue
+        open_total += remaining
+        if debt.loan_type == Debt.LoanType.MULTI:
+            base = item.base_amount or item.amount - item.penalty_amount
+            capital += min(remaining, base) * ratio
+        due.append({"debtId": debt.reference, "kind": "installment" if debt.loan_type == Debt.LoanType.MULTI else "interest",
+                    "number": item.number, "dueDate": item.due_date, "amount": remaining})
+    if debt.loan_type == Debt.LoanType.SINGLE:
+        capital = max(debt.capital_remaining, zero)
+        if capital > 0:
+            due.append({"debtId": debt.reference, "kind": "capital", "number": None,
+                        "dueDate": debt.due_date, "amount": capital})
+        total = money(capital + open_total)
+    else:
+        total = money(open_total)
+    capital = min(money(capital), total)
     summary = {"id": debt.reference, "status": debt.current_status, "dueDate": debt.due_date,
-               "capital": capital, "interest": interest, "total": capital + interest,
-               "paid": paid, "due": sum((item["amount"] for item in due), zero)}
+               "capital": capital, "interest": total - capital, "total": total}
     return summary, due
 
 
 class ClientPublicSerializer(serializers.Serializer):
     """Read-only, unauthenticated payload for a client's own share link.
 
-    Shows only capital, interest and total per debt, the payments made, and the
-    payments still due. Deliberately excludes phone/email/address/notes, rates,
+    Shows only what is owed now (capital, interest and their total, for each
+    open debt), the payments made, and the payments still due. Fully paid debts
+    are left out. Deliberately excludes phone/email/address/notes, rates,
     internal ledger fields, and anything belonging to another client or the
     owner's account."""
 
@@ -232,12 +248,13 @@ class ClientPublicSerializer(serializers.Serializer):
                         .select_related("debt").order_by("-payment_date", "-created_at"))
         debts, payments_due = [], []
         for debt in client.debts.prefetch_related("installments").order_by("-created_at"):
-            summary, due = _public_debt_statement(debt, [item for item in payments if item.debt_id == debt.pk])
-            debts.append(summary)
+            summary, due = _public_debt_statement(debt)
+            if summary["total"] > 0:
+                debts.append(summary)
             payments_due.extend(due)
         payments_due.sort(key=lambda item: item["dueDate"])
         zero = Decimal("0")
-        totals = {key: sum((item[key] for item in debts), zero) for key in ("capital", "interest", "total", "paid", "due")}
+        totals = {key: sum((item[key] for item in debts), zero) for key in ("capital", "interest", "total")}
         return {
             "name": client.name,
             "summary": totals,
