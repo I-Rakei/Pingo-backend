@@ -281,8 +281,9 @@ UUIDs so records can survive local integer-ID differences.
 - `notes`: optional
 - `mobile_device` and `mobile_local_id`: origin identity for offline migration
 
-`(mobile_device, mobile_local_id)` is unique. A client cannot be deleted while
-protected debts or payments still reference it.
+`(mobile_device, mobile_local_id)` is unique. The model protects referenced
+clients from an incomplete deletion. The web deletion service removes the
+client's documents, payments, and debts first, within the same transaction.
 
 ### Preference
 
@@ -634,10 +635,12 @@ to replace local state from `/api/bootstrap/`.
 
 ### Navigation
 
-Navigation is state-based, not React Router. `activeItem` selects Dashboard,
-Debts, Clients, History, or Settings; profile IDs are held separately. There is no
-stable URL for every page. Notification deep links can use `?debt=PNG-...`; the
-app opens that debt and then removes the query parameter.
+Navigation uses `use-workspace-navigation.js` and URL hashes: `#clients`,
+`#history`, `#settings`, `#client-profile/<id>`, `#debt-profile/<reference>`,
+and the other main pages. Refresh restores the same page and selected record.
+Browser Back/Forward restore navigation too. Existing `?debt=PNG-...`
+notification links open the debt and become a persistent profile hash. Public
+share and password-reset query links retain their existing behavior.
 
 The sidebar contains:
 
@@ -668,16 +671,20 @@ editing is currently a desktop/web feature.
 Web client deletion (2026-10-05) is available from the row actions and profile.
 The confirmation defaults focus to Cancel, prevents duplicate submissions, and
 shows API errors inline. Successful deletion removes the row and returns an open
-profile to Clients. The API returns 409 `client_has_records` for linked debts,
-payments, or fiscal documents; those records remain intact. Deletion invalidates
-the client's share link and emits a scoped v2 tombstone. A v1 snapshot holding
-that deleted client can still sync when it has no linked offline debts. If such
-debts exist, sync reports a conflict and leaves the phone data intact.
+profile to Clients. Following the user's correction, deletion includes all linked
+debts, installments, payments, and the four types of fiscal documents. The dialog
+states this explicitly. The deletion service is atomic and invalidates the
+client's share link; deleted ledger rows emit scoped v2 tombstones. A stale v1
+snapshot can acknowledge the already-deleted ledger without recreating it.
+New offline records linked to a deleted client/debt instead cause a sync error
+and remain on the phone for resolution. Other clients' ledgers remain intact.
 
-Verification: 96 backend tests pass, including seven client-deletion cases;
+Verification: 98 backend tests pass, including nine client-deletion cases;
 web lint/build pass with existing warnings. Headless browser checks cover the
-desktop/mobile actions, cancellation, initial focus, API success and protection
-errors, profile navigation, and layout at 375 px. No deployment was performed.
+desktop/mobile actions, cancellation, initial focus, API success/error/retry,
+all main-page and profile refreshes, browser history, notification links, and
+layout at 375 px. Mobile TypeScript, lint, and all five sync regression scripts
+pass with existing warnings. No deployment was performed.
 
 History is an audit page, not an alternate debt detail screen. It has debts and
 payments tabs, filters, CSV export, ten-row pagination, and a user column. Row
@@ -729,7 +736,6 @@ from Expo local notifications on the native app.
   client-side. Server pagination will be needed for large datasets.
 - Live updates currently refetch the full workspace after a 500 ms debounce;
   row patching and server pagination are future scalability work.
-- Navigation is not URL-addressable except for debt notification query links.
 - The current production bundle reports a chunk larger than 500 kB after
   minification. Code splitting is a future optimization, not a functional blocker.
 - `pingo-data.js` may contain legacy sample helpers. Do not treat sample arrays as

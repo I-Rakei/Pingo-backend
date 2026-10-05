@@ -1,7 +1,6 @@
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models.deletion import ProtectedError
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
@@ -26,7 +25,7 @@ from .serializers import (AmortizationScheduleSerializer, BalanceNoteSerializer,
                           PaymentRequestSerializer, PaymentSerializer, PreferenceSerializer, StaffCreateSerializer,
                           StaffMemberSerializer, StaffUpdateSerializer, UserSerializer, UserUpdateSerializer,
                           WebPushSubscriptionSerializer)
-from .services import (assess_overdue_penalties, create_debt, create_organization_with_owner, create_staff_account, generate_share_token,
+from .services import (assess_overdue_penalties, create_debt, create_organization_with_owner, create_staff_account, delete_client, generate_share_token,
                        get_membership, issue_document, record_payment, remove_staff_account, require_owner_role,
                        resolve_scope, revert_installment, update_staff_account)
 
@@ -348,12 +347,7 @@ def client_detail_view(request, client_id):
     if not client:
         return Response({"detail": "Client not found."}, status=status.HTTP_404_NOT_FOUND)
     if request.method == "DELETE":
-        try:
-            with transaction.atomic():
-                client.delete()
-        except ProtectedError:
-            return Response({"detail": "This client has linked debts, payments, or financial documents and cannot be deleted.",
-                             "code": "client_has_records"}, status=status.HTTP_409_CONFLICT)
+        delete_client(client)
         return Response(status=status.HTTP_204_NO_CONTENT)
     if request.method == "PATCH":
         serializer = ClientSerializer(client, data=request.data, partial=True)

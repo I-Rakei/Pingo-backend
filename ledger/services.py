@@ -22,6 +22,19 @@ DOCUMENT_MODELS = {
 }
 
 
+@transaction.atomic
+def delete_client(client):
+    """Delete the client's complete ledger and issued documents together."""
+    client = Client.objects.select_for_update().get(pk=client.pk)
+    for model in DOCUMENT_MODELS.values():
+        model.objects.filter(Q(client=client) | Q(debt__client=client) | Q(payment__client=client)).delete()
+    # Explicit ordering satisfies PROTECT relationships while model signals
+    # record the same deletion in the mobile/web change feed.
+    Payment.objects.filter(client=client).delete()
+    Debt.objects.filter(client=client).delete()
+    client.delete()
+
+
 def money(value):
     return Decimal(value).quantize(MONEY, rounding=ROUND_HALF_UP)
 

@@ -57,6 +57,17 @@ def _existing_for_row(model, user, device, local_id, row):
     return model.objects.filter(mobile_device=device, mobile_local_id=local_id).first()
 
 
+def _deleted_on_server(entity, user, row):
+    server_id = row.get("serverId")
+    if not server_id:
+        return False
+    try:
+        return SyncChange.objects.filter(owner=user, organization__isnull=True,
+            entity=entity, entity_id=server_id).order_by("-id").values_list("op", flat=True).first() == "delete"
+    except (DjangoValidationError, ValueError, TypeError):
+        return False
+
+
 def _mobile_is_newer(instance, row):
     value = row.get("updatedAt")
     if not value:
@@ -205,16 +216,9 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
         # Upload-first v1 phones may still hold a client deleted on the web.
         # Only acknowledge a scoped tombstone; unknown/foreign IDs still fail
         # validation. Never discard an offline debt linked to that client.
-        server_id = row.get("serverId")
-        try:
-            deleted_on_server = bool(server_id) and SyncChange.objects.filter(
-                owner=user, organization__isnull=True, entity="client",
-                entity_id=server_id,
-            ).order_by("-id").values_list("op", flat=True).first() == "delete"
-        except (DjangoValidationError, ValueError, TypeError):
-            deleted_on_server = False
-        if deleted_on_server:
-            if any(str(debt.get("clientLocalId", debt.get("client_id"))) == local_id for debt in debts):
+        if _deleted_on_server("client", user, row):
+            if any(str(debt.get("clientLocalId", debt.get("client_id"))) == local_id
+                   and not _deleted_on_server("debt", user, debt) for debt in debts):
                 raise ValidationError({"snapshot": "A client was deleted on the web but still has debts on this phone. Reassign those debts to another client before syncing."})
             continue
         client_map[local_id] = _upsert(Client, user, device, local_id, row, {
@@ -230,6 +234,14 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
 
     for row in debts:
         local_id, client_local_id = _local_id(row), row.get("clientLocalId", row.get("client_id"))
+        if _deleted_on_server("debt", user, row):
+            # Synced descendants follow the explicit server deletion. New
+            # offline facts have no tombstone and must not be silently lost.
+            for entity, rows in (("installment", installments), ("payment", payments)):
+                if any(str(item.get("debtLocalId", item.get("debt_id"))) == local_id
+                       and not _deleted_on_server(entity, user, item) for item in rows):
+                    raise ValidationError({"snapshot": "A deleted debt has new records on this phone. Resolve those offline records before syncing."})
+            continue
         client = client_map.get(str(client_local_id))
         if not client:
             raise ValidationError({"snapshot": f"Debt {local_id} references a missing clientLocalId."})
@@ -254,6 +266,8 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
 
     for row in installments:
         local_id, debt_local_id = _local_id(row), row.get("debtLocalId", row.get("debt_id"))
+        if _deleted_on_server("installment", user, row):
+            continue
         debt = debt_map.get(str(debt_local_id))
         if not debt:
             raise ValidationError({"snapshot": f"Installment {local_id} references a missing debtLocalId."})
@@ -280,6 +294,8 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
 
     for row in payments:
         local_id, debt_local_id = _local_id(row), row.get("debtLocalId", row.get("debt_id"))
+        if _deleted_on_server("payment", user, row):
+            continue
         debt = debt_map.get(str(debt_local_id))
         if not debt:
             raise ValidationError({"snapshot": f"Payment {local_id} references a missing debtLocalId."})
