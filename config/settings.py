@@ -75,6 +75,8 @@ EMAIL_HOST = os.getenv("EMAIL_HOST", "")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+# Bound relay waits so a stalled connection does not stop notification retries.
+EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "30"))
 # Providers differ: Gmail/most SMTP relays use STARTTLS on 587 (EMAIL_USE_TLS);
 # Resend's relay uses implicit SSL on 465 (EMAIL_USE_SSL). Only one of the two
 # should be true at once -- Django raises if both are set.

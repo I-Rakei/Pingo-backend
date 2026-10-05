@@ -7,3 +7,4 @@ class LedgerConfig(AppConfig):
 
     def ready(self):
         from . import sync_log  # noqa: F401
+        from . import client_notifications  # noqa: F401

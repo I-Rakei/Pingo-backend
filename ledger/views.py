@@ -10,7 +10,6 @@ from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .client_notifications import notify_debt_created, notify_payment_received
 from .models import (Client, Debt, DocumentSequence, MobileDevice, OrganizationMembership, Payment, Preference,
                      WebPushSubscription)
 from .mobile_sync import snapshot_for_user, sync_snapshot
@@ -404,7 +403,6 @@ def debts_view(request):
     serializer.is_valid(raise_exception=True)
     debt = create_debt(request.user, serializer.validated_data)
     debt = Debt.objects.select_related("client").prefetch_related("installments").get(pk=debt.pk)
-    notify_debt_created(debt)
     return Response(DebtSerializer(debt).data, status=status.HTTP_201_CREATED)
 
 
@@ -441,8 +439,6 @@ def debt_payment_view(request, reference):
         return Response({"detail": "Debt not found."}, status=status.HTTP_404_NOT_FOUND)
     debt, payments = record_payment(request.user, reference, serializer.validated_data)
     debt = Debt.objects.select_related("client").prefetch_related("installments").get(pk=debt.pk)
-    for payment in payments:
-        notify_payment_received(debt, payment)
     return Response({"debt": DebtSerializer(debt).data, "payments": PaymentSerializer(payments, many=True).data})
 
 

@@ -1122,14 +1122,32 @@ Use `npx eas-cli@latest`; `eas` may not be globally installed and `npx eas` does
 not reliably identify the package. A new APK is required for native config, schema,
 background scheduling, or bundled JavaScript changes used outside Expo updates.
 
-## 15. Push notification operations
+## 15. Client email and push notification operations
 
 Generate a VAPID key once per environment and keep the private key stable. Changing
 it invalidates the relationship with existing browser subscriptions.
 
-`run_notification_worker` is the long-running PM2 process. The one-shot command
-`send_due_notifications` is useful for debugging scheduled events. `PushDelivery`
-prevents duplicate event messages for the same owner/event key.
+`run_notification_worker` is the long-running PM2 process and checks every 60
+seconds by default. The one-shot command `send_due_notifications` delivers pending
+client emails as well as scheduled reminders; a cron alternative should run every
+minute. `PushDelivery` prevents duplicate event messages for the same owner/event
+key and stores pending/sending/sent/cancelled email states. Failed deliveries are
+retried, and stale worker claims can be recovered after five minutes.
+
+Model signals queue welcome, new-loan, payment-receipt, and full-payment emails
+for clients with recorded email addresses, including web, mobile v1, and mobile
+v2 writes. Queue records share the ledger transaction, so rolled-back writes do
+not send mail. SMTP runs in the worker, with a default 30-second `EMAIL_TIMEOUT`.
+The existing SMTP settings must be configured in production; the development
+default is console output. This change uses the existing table without a migration.
+
+Client emails include day-before reminders and one combined overdue reminder per
+debt every 30 days after the last successful reminder until it is paid. Owner push
+preferences do not disable client email. Owner browser push keeps its daily
+per-installment overdue cadence. Client email tests cover web and both mobile
+protocols, duplicate syncs, settlement/re-payment, the 30-day interval, rollback,
+deleted records, SMTP retries, and stale claims. All 109 ledger tests passed locally;
+production deployment has not been performed.
 
 Push troubleshooting order:
 

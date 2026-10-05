@@ -17,6 +17,7 @@ from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, Installme
                      Organization, OrganizationMembership, Payment, PushDelivery, WebPushSubscription)
 from .password_reset import token_generator
 from .push import send_due_notifications
+from .client_notifications import send_client_emails
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 
@@ -744,6 +745,8 @@ class ClientNotificationApiTests(TestCase):
     def create_client_with_email(self, email="ana@example.com"):
         response = self.api.post("/api/clients/", {"name": "Ana", "email": email}, format="json")
         self.assertEqual(response.status_code, 201, response.data)
+        send_client_emails()
+        mail.outbox.clear()
         return response.data["id"]
 
     def create_debt(self, client_id, **overrides):
@@ -751,6 +754,7 @@ class ClientNotificationApiTests(TestCase):
         payload.update(overrides)
         response = self.api.post("/api/debts/", payload, format="json")
         self.assertEqual(response.status_code, 201, response.data)
+        send_client_emails()
         return response.data
 
     def test_client_with_email_is_notified_when_debt_is_created(self):
@@ -771,6 +775,7 @@ class ClientNotificationApiTests(TestCase):
         mail.outbox.clear()
         response = self.api.post(f"/api/debts/{debt['id']}/payments/", {"action": "balance", "amount": "50"}, format="json")
         self.assertEqual(response.status_code, 200, response.data)
+        send_client_emails()
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn("ana@example.com", mail.outbox[0].to)
         self.assertIn("payment", mail.outbox[0].subject.lower())

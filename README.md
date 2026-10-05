@@ -116,7 +116,7 @@ enables a device-first rollout. Corporate accounts remain blocked on mobile.
 V1 batches, tombstones, and the endpoint must remain until the post-rollout D5
 window has elapsed and old APKs are accounted for.
 
-## Browser push notifications
+## Client emails and browser push notifications
 
 Generate one VAPID key for each deployed environment:
 
@@ -126,13 +126,19 @@ py manage.py generate_vapid_keys
 
 The private key is stored in the ignored `.secrets` directory by default. Set `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT` in production. The React Settings page registers a browser subscription through `/api/push/subscription/` and can send a test through `/api/push/test/`.
 
-Run the due-reminder scheduler under the same process supervisor used for Django:
+Run the notification worker under the same process supervisor used for Django:
 
 ```powershell
 py manage.py run_notification_worker
 ```
 
-Alternatively, schedule `py manage.py send_due_notifications` hourly. Web Push requires HTTPS in production; localhost is accepted during development. The worker sends one reminder the day before an unpaid installment and at most one overdue notification per installment per day, following each user's notification preferences.
+The worker checks every 60 seconds by default. Alternatively, schedule `py manage.py send_due_notifications` every minute.
+
+Clients with a recorded email receive welcome, new-loan, payment-receipt, and full-payment emails for changes from web or mobile (both sync protocols). Emails are queued transactionally in the existing `PushDelivery` table and retried after delivery failures. No database migration is required. Configure `DJANGO_EMAIL_BACKEND` and the existing `EMAIL_*` settings for a real SMTP relay; the development default prints mail to the console. `EMAIL_TIMEOUT` defaults to 30 seconds.
+
+Client reminders include a notice the day before an unpaid installment and one combined overdue email per debt. Overdue emails repeat every 30 days after the last successful reminder while the debt remains overdue, and stop after payment. Owner browser-push preferences do not disable client emails.
+
+Web Push requires HTTPS in production; localhost is accepted during development. Owner push notifications retain the day-before reminder and at most one overdue notification per installment per day, following each user's notification preferences.
 
 ## Verification
 

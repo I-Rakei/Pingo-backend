@@ -4,10 +4,10 @@ from ledger.push import send_due_notifications
 
 
 class Command(BaseCommand):
-    help = "Send due-tomorrow and overdue web push notifications. Run this command hourly."
+    help = "Deliver pending client emails and due-tomorrow/overdue reminders. Run at least every minute."
 
     def handle(self, *args, **options):
         result = send_due_notifications()
         self.stdout.write(self.style.SUCCESS(
-            "Push notifications: " + ", ".join(f"{key}={value}" for key, value in result.items())
+            "Notifications: " + ", ".join(f"{key}={value}" for key, value in result.items())
         ))
