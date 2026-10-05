@@ -13,6 +13,7 @@ from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
 
 from .models import Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment, SyncChange
+from .client_notifications import combine_payment_emails
 from .services import money, next_reference, reconcile_debt
 
 
@@ -186,6 +187,7 @@ def snapshot_for_user(user, device=None):
 
 
 @transaction.atomic
+@combine_payment_emails()
 def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
     """Upsert a complete snapshot. Missing rows are never treated as deletions."""
     device, created = MobileDevice.objects.get_or_create(

@@ -136,6 +136,8 @@ The worker checks every 60 seconds by default. Alternatively, schedule `py manag
 
 Clients with a recorded email receive welcome, new-loan, payment-receipt, and full-payment emails for changes from web or mobile (both sync protocols). Emails are queued transactionally in the existing `PushDelivery` table and retried after delivery failures. No database migration is required. Configure `DJANGO_EMAIL_BACKEND` and the existing `EMAIL_*` settings for a real SMTP relay; the development default prints mail to the console. `EMAIL_TIMEOUT` defaults to 30 seconds.
 
+A repayment produces one receipt with the total paid, a breakdown of its interest/principal or installment allocations, and the remaining balance. Web receipts group rows by payment operation; mobile receipts combine newly imported rows per debt in a sync snapshot or mutation. A final repayment includes the fully paid confirmation in that same email, including any earlier payment amounts still awaiting email delivery.
+
 Client reminders include a notice the day before an unpaid installment and one combined overdue email per debt. Overdue emails repeat every 30 days after the last successful reminder while the debt remains overdue, and stop after payment. Owner browser-push preferences do not disable client emails.
 
 Web Push requires HTTPS in production; localhost is accepted during development. Owner push notifications retain the day-before reminder and at most one overdue notification per installment per day, following each user's notification preferences.

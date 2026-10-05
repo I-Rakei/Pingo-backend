@@ -59,6 +59,129 @@ class ClientEmailTests(TestCase):
         record_payment(self.user, debt.reference, {"action": "balance", "amount": "75"})
         self.assertEqual(send_client_emails(), 1, "one full-payment email, not one per installment allocation")
         self.assertEqual(mail.outbox[0].subject, "Loan fully paid")
+        self.assertIn("payment of 75.00", mail.outbox[0].body)
+        self.assertIn("Remaining balance: 0.00", mail.outbox[0].body)
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_single_loan_settlement_combines_interest_and_principal(self):
+        debt = self.debt(loanType="single", interestRate=Decimal("10"))
+        self.drain()
+        record_payment(self.user, debt.reference, {"action": "settle"})
+        self.assertEqual(send_client_emails(), 1)
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.subject, "Loan fully paid")
+        self.assertIn("payment of 110.00", message.body)
+        self.assertIn("Interest (installment 1): 10.00", message.body)
+        self.assertIn("Principal: 100.00", message.body)
+        self.assertIn("Remaining balance: 0.00", message.body)
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_partial_payment_across_installments_gets_one_combined_receipt(self):
+        debt = self.debt(durationMonths=2)
+        self.drain()
+        record_payment(self.user, debt.reference, {"action": "balance", "amount": "75"})
+        with patch("ledger.client_notifications.send_mail", return_value=0):
+            self.assertEqual(send_client_emails(), 0)
+        self.assertEqual(send_client_emails(), 1)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("payment of 75.00", mail.outbox[0].body)
+        self.assertIn("Principal (installment 1): 50.00", mail.outbox[0].body)
+        self.assertIn("Principal (installment 2): 25.00", mail.outbox[0].body)
+        self.assertIn("Remaining balance: 25.00", mail.outbox[0].body)
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_separate_payment_actions_keep_separate_receipts(self):
+        debt = self.debt()
+        self.drain()
+        record_payment(self.user, debt.reference, {"action": "balance", "amount": "20"})
+        record_payment(self.user, debt.reference, {"action": "balance", "amount": "30"})
+        self.assertEqual(send_client_emails(), 2)
+        self.assertIn("payment of 20.00", mail.outbox[0].body)
+        self.assertIn("payment of 30.00", mail.outbox[1].body)
+
+    def test_pending_receipts_from_previous_worker_are_combined_on_upgrade(self):
+        debt = self.debt(durationMonths=2)
+        self.drain()
+        _, payments = record_payment(self.user, debt.reference, {"action": "balance", "amount": "75"})
+        PushDelivery.objects.filter(payload__kind="payment_received").delete()
+        for payment in payments:
+            queue_client_email(self.client_row, "payment_received", f"client:payment:{payment.public_id}:received",
+                               debtId=str(debt.public_id), paymentId=str(payment.public_id))
+        self.assertEqual(send_client_emails(), 1)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("payment of 75.00", mail.outbox[0].body)
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_settlement_includes_earlier_pending_payment_information(self):
+        debt = self.debt(loanType="single", interestRate=Decimal("10"))
+        self.drain()
+        record_payment(self.user, debt.reference, {"action": "principal", "amount": "50"})
+        record_payment(self.user, debt.reference, {"action": "settle"})
+        self.assertEqual(send_client_emails(), 1)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("payment of 105.00", mail.outbox[0].body)
+        self.assertEqual(mail.outbox[0].body.count("Principal: 50.00"), 2)
+        self.assertIn("Interest (installment 1): 5.00", mail.outbox[0].body)
+        self.assertIn("Remaining balance: 0.00", mail.outbox[0].body)
+
+    def test_legacy_pending_settlement_includes_all_split_amounts(self):
+        debt = self.debt(loanType="single", interestRate=Decimal("10"))
+        self.drain()
+        _, payments = record_payment(self.user, debt.reference, {"action": "settle"})
+        PushDelivery.objects.filter(payload__kind="payment_received").delete()
+        settlement = PushDelivery.objects.get(payload__kind="debt_paid")
+        settlement.payload.pop("paymentIds")
+        settlement.save()
+        for payment in payments:
+            queue_client_email(self.client_row, "payment_received", f"client:payment:{payment.public_id}:received",
+                               debtId=str(debt.public_id), paymentId=str(payment.public_id))
+        self.assertEqual(send_client_emails(), 1)
+        self.assertIn("payment of 110.00", mail.outbox[0].body)
+        self.assertIn("Principal: 100.00", mail.outbox[0].body)
+        self.assertIn("Interest (installment 1): 10.00", mail.outbox[0].body)
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_mobile_v2_partial_payment_rows_share_one_receipt(self):
+        debt = self.debt(durationMonths=2)
+        self.drain()
+        device = bind_device(self.user, str(uuid.uuid4()), "Combined email test")
+        installments = list(debt.installments.order_by("number"))
+        payload = {"type": "push", "mutationId": str(uuid.uuid4()), "action": "payDebtBalance", "changes": [
+            {"entity": "payment", "id": str(uuid.uuid4()), "op": "insert", "fields": {
+                "debtId": str(debt.public_id), "installmentId": str(installment.public_id),
+                "operationId": str(uuid.uuid4()), "amount": amount, "type": "principal",
+                "date": self.today.isoformat(), "note": ""}}
+            for installment, amount in zip(installments, ("50", "25"))]}
+        result = apply_mutation(self.user, device, payload)
+        self.assertEqual(result["status"], "applied", result)
+        self.assertEqual(send_client_emails(), 1)
+        self.assertIn("payment of 75.00", mail.outbox[0].body)
+        self.assertIn("Remaining balance: 25.00", mail.outbox[0].body)
+        self.assertEqual(apply_mutation(self.user, device, payload)["status"], "duplicate")
+        self.assertEqual(send_client_emails(), 0)
+
+    def test_mobile_v1_partial_payment_rows_share_one_receipt(self):
+        debt = self.debt(durationMonths=2)
+        self.drain()
+        device = MobileDevice.objects.create(owner=self.user, device_id="combined-v1-phone")
+        installment = debt.installments.first()
+        # Legacy snapshots have no shared operation ID for a repayment's rows.
+        snapshot = {"clients": [{"localId": "1", "serverId": str(self.client_row.public_id), "name": "Ana",
+                                  "email": self.client_row.email}],
+            "debts": [{"localId": "1", "serverId": str(debt.public_id), "clientLocalId": "1",
+                "loanType": "multi", "amount": "100", "interestRate": "0", "penaltyRate": "0",
+                "durationMonths": 2, "startDate": self.today.isoformat(), "dueDate": debt.due_date.isoformat()}],
+            "installments": [{"localId": "1", "serverId": str(installment.public_id), "debtLocalId": "1",
+                "installmentNumber": 1, "baseAmount": "50", "totalAmount": "50",
+                "dueDate": installment.due_date.isoformat()}],
+            "payments": [{"localId": str(index), "debtLocalId": "1", "installmentLocalId": "1",
+                          "amount": amount, "createdAt": self.today.isoformat(), "type": "principal"}
+                         for index, amount in enumerate(("10", "15"), start=1)]}
+        sync_snapshot(user=self.user, device_id=device.device_id, device_label="", batch_id="combined", snapshot=snapshot)
+        self.assertEqual(send_client_emails(), 1)
+        self.assertIn("payment of 25.00", mail.outbox[0].body)
+        self.assertIn("Remaining balance: 75.00", mail.outbox[0].body)
         self.assertEqual(send_client_emails(), 0)
 
     def test_repaid_loan_gets_a_new_settlement_email(self):

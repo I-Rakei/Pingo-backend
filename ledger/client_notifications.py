@@ -7,6 +7,9 @@ delivers them after commit and retries failures without blocking ledger writes.
 import hashlib
 import json
 import logging
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from decimal import Decimal
 
@@ -21,6 +24,17 @@ from django.utils.dateparse import parse_date, parse_datetime
 from .models import Client, Debt, Payment, PushDelivery
 
 logger = logging.getLogger(__name__)
+_payment_batch = ContextVar("pingo_payment_email_batch", default=None)
+
+
+@contextmanager
+def combine_payment_emails():
+    """Combine newly imported payment rows per debt in one mobile sync action."""
+    token = _payment_batch.set(str(uuid.uuid4()))
+    try:
+        yield
+    finally:
+        _payment_batch.reset(token)
 
 
 def send_to_client(client, subject, message):
@@ -65,20 +79,33 @@ def notify_debt_created(debt, original_total=None):
     )
 
 
-def notify_payment_received(debt, payment):
+def notify_payment_received(debt, payments, fully_paid=False):
+    total = sum((payment.amount for payment in payments), Decimal("0"))
+    confirmation = "Your loan has been fully paid. There is no remaining balance.\n" if fully_paid else ""
+    details = ""
+    if len(payments) > 1:
+        details = "Payment breakdown:\n" + "".join(
+            f"- {payment.get_payment_type_display()}"
+            f"{f' (installment {payment.installment.number})' if payment.installment_id else ''}: {payment.amount:.2f}\n"
+            for payment in payments
+        )
     return send_to_client(
         debt.client,
-        subject="Payment received",
+        subject="Loan fully paid" if fully_paid else "Payment received",
         message=(
             f"Hello {debt.client.name},\n\n"
-            f"We've recorded a payment of {payment.amount:.2f} on your loan {debt.reference}.\n"
-            f"Remaining balance: {debt.outstanding:.2f}.\n\n"
+            f"We've recorded a payment of {total:.2f} on your loan {debt.reference}.\n"
+            f"{details}"
+            f"Remaining balance: {debt.outstanding:.2f}.\n"
+            f"{confirmation}\n"
             "Thank you."
         ),
     )
 
 
-def notify_debt_paid(debt):
+def notify_debt_paid(debt, payments):
+    if payments:
+        return notify_payment_received(debt, payments, fully_paid=True)
     return send_to_client(debt.client, "Loan fully paid", (
         f"Hello {debt.client.name},\n\n"
         f"Your loan {debt.reference} has been fully paid. "
@@ -135,15 +162,48 @@ def queue_debt_event(sender, instance, created, raw=False, **kwargs):
                            debtId=str(instance.public_id), originalTotal=str(instance.total))
     if instance.status == Debt.Status.PAID and instance.outstanding <= 0:
         settlement = _settlement(instance)
+        payments = _pending_payment_ids(instance)
         queue_client_email(instance.client, "debt_paid", f"client:debt:{instance.public_id}:paid:{settlement}",
-                           debtId=str(instance.public_id), settlement=settlement)
+                           debtId=str(instance.public_id), settlement=settlement, paymentIds=payments)
 
 
 @receiver(post_save, sender=Payment)
 def queue_payment_event(sender, instance, created, raw=False, **kwargs):
     if created and not raw and instance.reversed_at is None:
-        queue_client_email(instance.client, "payment_received", f"client:payment:{instance.public_id}:received",
-                           debtId=str(instance.debt.public_id), paymentId=str(instance.public_id))
+        group = _payment_batch.get() or str(instance.operation_id)
+        event = queue_client_email(instance.client, "payment_received",
+            f"client:debt:{instance.debt.public_id}:payment:{group}",
+            debtId=str(instance.debt.public_id), paymentIds=[])
+        if event:
+            event.payload["paymentIds"].append(str(instance.public_id))
+            event.save(update_fields=["payload", "updated_at"])
+
+
+def _receipt_payments(debt, payload):
+    active = debt.payments.filter(reversed_at__isnull=True).select_related("installment")
+    if payload.get("paymentIds"):
+        return list(active.filter(public_id__in=payload["paymentIds"]).order_by("id"))
+    # Queued events from the previous worker used one event per payment row.
+    # Resolve their shared operation so an upgrade also combines pending mail.
+    payment = active.filter(public_id=payload.get("paymentId")).first()
+    if payment:
+        return list(active.filter(operation_id=payment.operation_id).order_by("id"))
+    if payload["kind"] == "debt_paid":
+        pending_ids = _pending_payment_ids(debt)
+        if pending_ids:
+            return list(active.filter(public_id__in=pending_ids).order_by("id"))
+        latest = active.order_by("-created_at", "-id").first()
+        return list(active.filter(operation_id=latest.operation_id).order_by("id")) if latest else []
+    return []
+
+
+def _pending_payment_ids(debt):
+    receipts = PushDelivery.objects.filter(owner=debt.client.owner, payload__kind="payment_received",
+        payload__debtId=str(debt.public_id), payload__emailStatus="pending")
+    ids = set()
+    for receipt in receipts:
+        ids.update(receipt.payload.get("paymentIds", [receipt.payload.get("paymentId")]))
+    return sorted(str(item) for item in ids if item)
 
 
 def _deliver(event, today):
@@ -162,14 +222,16 @@ def _deliver(event, today):
     if kind == "debt_paid":
         if debt.status != Debt.Status.PAID or debt.outstanding > 0 or _settlement(debt) != payload["settlement"]:
             return None
-        return notify_debt_paid(debt)
+        return notify_debt_paid(debt, _receipt_payments(debt, payload))
     if kind == "payment_received":
-        payment = Payment.objects.filter(public_id=payload["paymentId"], debt=debt, reversed_at__isnull=True).first()
+        payments = _receipt_payments(debt, payload)
         # The settlement email replaces individual receipts for a fully paid
         # loan, including payments allocated across multiple installments.
-        if not payment or debt.status == Debt.Status.PAID:
+        if not payments or debt.status == Debt.Status.PAID:
             return None
-        return notify_payment_received(debt, payment)
+        if payload.get("paymentId") and str(payments[0].public_id) != payload["paymentId"]:
+            return None
+        return notify_payment_received(debt, payments)
     if kind == "due_tomorrow":
         installment = debt.installments.filter(public_id=payload["installmentId"], due_date=today + timedelta(days=1),
                                               paid_amount__lt=F("amount")).first()

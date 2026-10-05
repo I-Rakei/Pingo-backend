@@ -1141,13 +1141,20 @@ not send mail. SMTP runs in the worker, with a default 30-second `EMAIL_TIMEOUT`
 The existing SMTP settings must be configured in production; the development
 default is console output. This change uses the existing table without a migration.
 
+Payment emails combine split records into one receipt with a total, an allocation
+breakdown, and the remaining balance. Web writes group by payment operation; mobile
+v1 snapshots and v2 mutations group newly inserted payment rows per debt. Fully
+paid emails include the payment details and absorb earlier pending receipts for
+that debt. Email grouping does not change payment facts or operation IDs. Retries
+retain the combined receipt, and repeated syncs do not queue it again.
+
 Client emails include day-before reminders and one combined overdue reminder per
 debt every 30 days after the last successful reminder until it is paid. Owner push
 preferences do not disable client email. Owner browser push keeps its daily
 per-installment overdue cadence. Client email tests cover web and both mobile
 protocols, duplicate syncs, settlement/re-payment, the 30-day interval, rollback,
-deleted records, SMTP retries, and stale claims. All 109 ledger tests passed locally;
-production deployment has not been performed.
+deleted records, SMTP retries, stale claims, and combined payment receipts.
+All 117 ledger tests passed locally; production deployment has not been performed.
 
 Push troubleshooting order:
 

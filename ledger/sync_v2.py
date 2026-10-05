@@ -15,6 +15,7 @@ from rest_framework.exceptions import ValidationError
 from .models import (Client, Debt, Installment, MobileDevice, Payment, SyncChange,
                      SyncConflict, SyncCursorFloor, SyncMutation)
 from .services import assess_overdue_penalties, money, next_reference, reconcile_debt, resolve_scope
+from .client_notifications import combine_payment_emails
 from .sync_log import canonical_row, sync_origin, wire_fields
 
 MODELS = {"client": Client, "debt": Debt, "installment": Installment, "payment": Payment}
@@ -384,6 +385,7 @@ def _apply_one(user, device, change, scope, touched_debts, created_debts, touche
 
 
 @transaction.atomic
+@combine_payment_emails()
 def apply_mutation(user, device, payload):
     if device.owner_id != user.pk:
         return {"type": "push_result", "status": "rejected", "error": "device_conflict"}
