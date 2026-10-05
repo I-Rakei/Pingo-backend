@@ -422,7 +422,7 @@ integer database ID. Sync identities are UUID strings.
 | GET | `/api/dashboard/summary/` | Dashboard totals |
 | GET | `/api/dashboard/debts/` | Dashboard debt list |
 | GET, POST | `/api/clients/` | List/create clients |
-| GET, PATCH | `/api/clients/<id>/` | Read/update an owned client |
+| GET, PATCH, DELETE | `/api/clients/<id>/` | Read/update/delete a client in the caller's ledger scope |
 | GET, POST, DELETE | `/api/debts/` | List/create or clear owned debt history |
 | GET, PATCH, DELETE | `/api/debts/<reference>/` | Owned debt detail/update/delete |
 | POST | `/api/debts/<reference>/payments/` | Record a payment action |
@@ -661,9 +661,23 @@ invoice or receipt download, and navigation to a debt's own profile. The debt
 profile is distinct from the client profile and includes its schedule and payment
 history.
 
-Clients provides ten-row pagination, creation, editing, and profile navigation.
+Clients provides ten-row pagination, creation, editing, deletion, and profile navigation.
 A client requires a name; phone, email, address, and notes are optional. Client
 editing is currently a desktop/web feature.
+
+Web client deletion (2026-10-05) is available from the row actions and profile.
+The confirmation defaults focus to Cancel, prevents duplicate submissions, and
+shows API errors inline. Successful deletion removes the row and returns an open
+profile to Clients. The API returns 409 `client_has_records` for linked debts,
+payments, or fiscal documents; those records remain intact. Deletion invalidates
+the client's share link and emits a scoped v2 tombstone. A v1 snapshot holding
+that deleted client can still sync when it has no linked offline debts. If such
+debts exist, sync reports a conflict and leaves the phone data intact.
+
+Verification: 96 backend tests pass, including seven client-deletion cases;
+web lint/build pass with existing warnings. Headless browser checks cover the
+desktop/mobile actions, cancellation, initial focus, API success and protection
+errors, profile navigation, and layout at 375 px. No deployment was performed.
 
 History is an audit page, not an alternate debt detail screen. It has debts and
 payments tabs, filters, CSV export, ten-row pagination, and a user column. Row

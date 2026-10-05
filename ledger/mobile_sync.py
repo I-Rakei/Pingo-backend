@@ -12,7 +12,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
 
-from .models import Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment
+from .models import Client, Debt, Installment, MobileDevice, MobileSyncBatch, Payment, SyncChange
 from .services import money, next_reference, reconcile_debt
 
 
@@ -202,6 +202,21 @@ def sync_snapshot(*, user, device_id, device_label, batch_id, snapshot):
 
     for row in clients:
         local_id = _local_id(row)
+        # Upload-first v1 phones may still hold a client deleted on the web.
+        # Only acknowledge a scoped tombstone; unknown/foreign IDs still fail
+        # validation. Never discard an offline debt linked to that client.
+        server_id = row.get("serverId")
+        try:
+            deleted_on_server = bool(server_id) and SyncChange.objects.filter(
+                owner=user, organization__isnull=True, entity="client",
+                entity_id=server_id,
+            ).order_by("-id").values_list("op", flat=True).first() == "delete"
+        except (DjangoValidationError, ValueError, TypeError):
+            deleted_on_server = False
+        if deleted_on_server:
+            if any(str(debt.get("clientLocalId", debt.get("client_id"))) == local_id for debt in debts):
+                raise ValidationError({"snapshot": "A client was deleted on the web but still has debts on this phone. Reassign those debts to another client before syncing."})
+            continue
         client_map[local_id] = _upsert(Client, user, device, local_id, row, {
             "owner": user,
             "name": str(row.get("name") or "").strip(),

@@ -1,6 +1,7 @@
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models.deletion import ProtectedError
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
@@ -341,11 +342,19 @@ def clients_view(request):
     return Response(ClientSerializer(client).data, status=status.HTTP_201_CREATED)
 
 
-@api_view(["GET", "PATCH"])
+@api_view(["GET", "PATCH", "DELETE"])
 def client_detail_view(request, client_id):
     client = Client.objects.filter(pk=client_id, **resolve_scope(request.user)).first()
     if not client:
         return Response({"detail": "Client not found."}, status=status.HTTP_404_NOT_FOUND)
+    if request.method == "DELETE":
+        try:
+            with transaction.atomic():
+                client.delete()
+        except ProtectedError:
+            return Response({"detail": "This client has linked debts, payments, or financial documents and cannot be deleted.",
+                             "code": "client_has_records"}, status=status.HTTP_409_CONFLICT)
+        return Response(status=status.HTTP_204_NO_CONTENT)
     if request.method == "PATCH":
         serializer = ClientSerializer(client, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
