@@ -3,7 +3,7 @@ from decimal import Decimal
 from django.conf import settings
 from rest_framework import serializers
 
-from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, Organization,
+from .models import (AmortizationPlan, BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, Organization,
                      OrganizationMembership, Payment, Preference)
 
 
@@ -45,11 +45,48 @@ class WebPushSubscriptionSerializer(serializers.Serializer):
         return {"p256dh": p256dh, "auth": auth}
 
 
+def _detail_list(value, keys, label):
+    """Normalise an optional list of small string records, dropping empty rows."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise serializers.ValidationError(f"{label} must be a list.")
+    rows = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise serializers.ValidationError(f"Each {label.lower()} entry must be an object.")
+        row = {}
+        for key, max_length in keys.items():
+            text = item.get(key) or ""
+            if not isinstance(text, str):
+                raise serializers.ValidationError({key: "Must be text."})
+            text = text.strip()
+            if len(text) > max_length:
+                raise serializers.ValidationError({key: f"Use at most {max_length} characters."})
+            row[key] = text
+        if any(row.values()):
+            rows.append(row)
+    if len(rows) > 10:
+        raise serializers.ValidationError(f"Add at most 10 {label.lower()}.")
+    return rows
+
+
+CONTACT_KEYS = {"name": 160, "relationship": 80, "phone": 40, "email": 254}
+BANK_ACCOUNT_KEYS = {"bank": 120, "accountNumber": 60, "nib": 40}
+
+
 class ClientSerializer(serializers.ModelSerializer):
     publicId = serializers.UUIDField(source="public_id", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
     address = serializers.CharField(required=False, allow_blank=True)
+    city = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    countryOfBirth = serializers.CharField(source="country_of_birth", max_length=120, required=False, allow_blank=True)
+    idNumber = serializers.CharField(source="id_number", max_length=60, required=False, allow_blank=True)
+    altPhone = serializers.CharField(source="alt_phone", max_length=40, required=False, allow_blank=True)
+    nuit = serializers.CharField(max_length=40, required=False, allow_blank=True)
+    contacts = serializers.JSONField(required=False)
+    bankAccounts = serializers.JSONField(source="bank_accounts", required=False)
 
     class Meta:
         model = Client
@@ -57,7 +94,23 @@ class ClientSerializer(serializers.ModelSerializer):
         # never part of the general authenticated payload. It is only ever
         # exposed via ClientShareSerializer from the dedicated share-management
         # endpoint.
-        fields = ["id", "publicId", "name", "phone", "email", "address", "notes", "createdAt", "updatedAt"]
+        fields = ["id", "publicId", "name", "phone", "email", "address", "notes", "city", "countryOfBirth", "idNumber",
+                  "altPhone", "nuit", "contacts", "bankAccounts", "createdAt", "updatedAt"]
+
+    CORPORATE_FIELDS = ("city", "countryOfBirth", "idNumber", "altPhone", "nuit", "contacts", "bankAccounts")
+
+    def __init__(self, *args, corporate=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Personal accounts keep the original client shape; extra details are corporate only.
+        if not corporate:
+            for name in self.CORPORATE_FIELDS:
+                self.fields.pop(name)
+
+    def validate_contacts(self, value):
+        return _detail_list(value, CONTACT_KEYS, "Contact persons")
+
+    def validate_bankAccounts(self, value):
+        return _detail_list(value, BANK_ACCOUNT_KEYS, "Bank accounts")
 
 
 class InstallmentSerializer(serializers.ModelSerializer):
@@ -377,23 +430,115 @@ class DocumentCreateSerializer(serializers.Serializer):
     reason = serializers.CharField(max_length=255, required=False, allow_blank=True)
 
 
-class AmortizationScheduleSerializer(serializers.Serializer):
-    """Constructed from a dict of {organization, debt} rather than a model
-    instance -- see amortization_schedule_view."""
+class AmortizationSimulationSerializer(serializers.Serializer):
+    clientName = serializers.CharField(max_length=160, required=False, allow_blank=True)
+    loanType = serializers.ChoiceField(choices=Debt.LoanType.values)
+    principal = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    interestRate = serializers.DecimalField(max_digits=7, decimal_places=2, min_value=Decimal("0"))
+    durationMonths = serializers.IntegerField(min_value=1, max_value=600)
+    startDate = serializers.DateField()
 
-    organization = OrganizationSerializer()
+    def validate(self, attrs):
+        start = attrs["startDate"]
+        if start.year + (start.month - 1 + attrs["durationMonths"]) // 12 > 9999:
+            raise serializers.ValidationError({"durationMonths": "The final date is outside the supported date range."})
+        interest = attrs["principal"] * attrs["interestRate"] / 100
+        period_amount = interest if attrs["loanType"] == Debt.LoanType.SINGLE else (attrs["principal"] + interest) / attrs["durationMonths"]
+        if period_amount > Decimal("999999999999.99"):
+            raise serializers.ValidationError({"principal": "The calculated payment exceeds the supported amount."})
+        return attrs
+
+
+class AmortizationPlanCreateSerializer(AmortizationSimulationSerializer):
+    clientId = serializers.IntegerField()
+
+
+class LoanPreviewSerializer(serializers.Serializer):
+    """Terms of a corporate loan before creation; mirrors DebtCreateSerializer's rules."""
+
+    clientName = serializers.CharField(max_length=160, required=False, allow_blank=True)
+    loanType = serializers.ChoiceField(choices=Debt.LoanType.values)
+    principal = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    interestRate = serializers.DecimalField(max_digits=7, decimal_places=2, min_value=Decimal("0"))
+    durationMonths = serializers.IntegerField(min_value=1, max_value=600, required=False, default=1)
+    startDate = serializers.DateField()
+    dueDate = serializers.DateField(required=False)
+
+    def validate(self, attrs):
+        start = attrs["startDate"]
+        if attrs["loanType"] == Debt.LoanType.SINGLE:
+            attrs["durationMonths"] = 1
+            if not attrs.get("dueDate"):
+                raise serializers.ValidationError({"dueDate": "Choose when the interest period ends."})
+            if attrs["dueDate"] < start:
+                raise serializers.ValidationError({"dueDate": "Must be on or after startDate."})
+        elif start.year + (start.month - 1 + attrs["durationMonths"]) // 12 > 9999:
+            raise serializers.ValidationError({"durationMonths": "The final date is outside the supported date range."})
+        interest = attrs["principal"] * attrs["interestRate"] / 100
+        period_amount = interest if attrs["loanType"] == Debt.LoanType.SINGLE else (attrs["principal"] + interest) / attrs["durationMonths"]
+        if period_amount > Decimal("999999999999.99") or attrs["principal"] + interest > Decimal("999999999999.99"):
+            raise serializers.ValidationError({"principal": "The loan total exceeds the supported amount."})
+        return attrs
+
+
+class AmortizationPlanSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(source="public_id", read_only=True)
+    clientId = serializers.IntegerField(source="client_id", read_only=True)
+    clientName = serializers.CharField(source="client.name", read_only=True)
+    createdBy = serializers.SerializerMethodField()
+    loanType = serializers.CharField(source="loan_type", read_only=True)
+    principal = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True, read_only=True)
+    interestRate = serializers.DecimalField(source="interest_rate", max_digits=7, decimal_places=2, coerce_to_string=True, read_only=True)
+    durationMonths = serializers.IntegerField(source="duration_months", read_only=True)
+    startDate = serializers.DateField(source="start_date", read_only=True)
+    scheduleTotal = serializers.DecimalField(source="schedule_total", max_digits=18, decimal_places=2, coerce_to_string=True, read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     debtId = serializers.SerializerMethodField()
-    clientName = serializers.SerializerMethodField()
-    installments = serializers.SerializerMethodField()
+    dueDate = serializers.DateField(source="due_date", read_only=True)
 
-    def get_debtId(self, obj):
-        return obj["debt"].reference
+    class Meta:
+        model = AmortizationPlan
+        fields = ["id", "clientId", "clientName", "createdBy", "debtId", "loanType", "principal", "interestRate", "durationMonths",
+                  "startDate", "dueDate", "scheduleTotal", "createdAt"]
 
-    def get_clientName(self, obj):
-        return obj["debt"].client.name
+    def get_debtId(self, plan):
+        return plan.debt.reference if plan.debt_id else ""
 
-    def get_installments(self, obj):
-        return InstallmentSerializer(obj["debt"].installments.all(), many=True).data
+    def get_createdBy(self, plan):
+        user = plan.created_by
+        return (user.get_full_name() or user.email or user.username) if user else ""
+
+
+class AmortizationRowSerializer(serializers.Serializer):
+    number = serializers.IntegerField()
+    rowType = serializers.CharField()
+    dueDate = serializers.DateField()
+    principalAmount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    interestAmount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    penaltyAmount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    paidAmount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    remainingAmount = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    capitalBalance = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+
+
+class AmortizationScheduleSerializer(serializers.Serializer):
+    organization = OrganizationSerializer()
+    debtId = serializers.CharField(allow_blank=True)
+    clientName = serializers.CharField(allow_blank=True)
+    loanType = serializers.CharField()
+    principal = serializers.DecimalField(max_digits=14, decimal_places=2, coerce_to_string=True)
+    interestRate = serializers.DecimalField(max_digits=7, decimal_places=2, coerce_to_string=True)
+    startDate = serializers.DateField()
+    dueDate = serializers.DateField()
+    principalTotal = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    interestTotal = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    penaltyTotal = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    scheduleTotal = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    # Simulations report the full schedule total here, which can exceed a single ledger amount.
+    collected = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    outstanding = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=True)
+    installments = AmortizationRowSerializer(many=True)
 
 
 class UserSerializer(serializers.Serializer):

@@ -41,5 +41,6 @@ class SyncBackfillMigrationTests(TransactionTestCase):
             self.assertEqual(changes[1].fields['outstanding'], '90.00')
             self.assertEqual(changes[3].fields['installmentId'], str(installment.public_id))
         finally:
+            # Restore the latest schema, not just 0008, so later tests see every migration.
             executor.loader.build_graph()
-            executor.migrate(to_state)
+            executor.migrate(executor.loader.graph.leaf_nodes())

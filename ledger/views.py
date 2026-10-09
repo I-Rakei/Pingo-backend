@@ -10,13 +10,13 @@ from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .models import (Client, Debt, DocumentSequence, MobileDevice, OrganizationMembership, Payment, Preference,
+from .models import (AmortizationPlan, Client, Debt, DocumentSequence, MobileDevice, OrganizationMembership, Payment, Preference,
                      WebPushSubscription)
 from .mobile_sync import snapshot_for_user, sync_snapshot
 from .password_reset import reset_password, send_no_account_email, send_password_reset_email
 from .push import get_vapid_public_key, send_push_to_user
 from .sync_v2 import latest_cursor
-from .serializers import (AmortizationScheduleSerializer, BalanceNoteSerializer, ClientPublicSerializer,
+from .serializers import (AmortizationPlanCreateSerializer, LoanPreviewSerializer, AmortizationPlanSerializer, AmortizationScheduleSerializer, AmortizationSimulationSerializer, BalanceNoteSerializer, ClientPublicSerializer,
                           ClientSerializer, ClientShareSerializer, CreditNoteSerializer, DebitNoteSerializer,
                           DebtCreateSerializer, DebtSerializer, DebtUpdateSerializer, DocumentCreateSerializer,
                           InvoiceSerializer, MobileAuthSerializer, MobileSyncSerializer, OrganizationSerializer,
@@ -24,9 +24,10 @@ from .serializers import (AmortizationScheduleSerializer, BalanceNoteSerializer,
                           PaymentRequestSerializer, PaymentSerializer, PreferenceSerializer, StaffCreateSerializer,
                           StaffMemberSerializer, StaffUpdateSerializer, UserSerializer, UserUpdateSerializer,
                           WebPushSubscriptionSerializer)
-from .services import (assess_overdue_penalties, create_debt, create_organization_with_owner, create_staff_account, delete_client, generate_share_token,
+from .services import (amortization_schedule_for_debt, amortization_schedule_for_plan, assess_overdue_penalties, create_debt, create_organization_with_owner, create_staff_account, delete_client, generate_share_token,
                        get_membership, issue_document, record_payment, remove_staff_account, require_owner_role,
-                       resolve_scope, revert_installment, update_staff_account)
+                       preview_loan_schedule, resolve_scope, revert_installment, save_amortization_plan, simulate_amortization_schedule,
+                       update_staff_account)
 
 DOCUMENT_SERIALIZERS = {
     DocumentSequence.DocumentType.INVOICE: InvoiceSerializer,
@@ -304,7 +305,7 @@ def bootstrap_view(request):
         organization = {"name": org.name, "role": membership.role, "nuit": org.nuit, "address": org.address}
     return Response({"user": UserSerializer(request.user).data, "settings": PreferenceSerializer(preference_for(request.user)).data,
                      "organization": organization, "syncCursor": sync_cursor,
-                     "clients": ClientSerializer(clients, many=True).data, "debts": DebtSerializer(debts, many=True).data,
+                     "clients": ClientSerializer(clients, many=True, corporate=membership is not None).data, "debts": DebtSerializer(debts, many=True).data,
                      "payments": PaymentSerializer(payments, many=True).data})
 
 
@@ -333,11 +334,11 @@ def dashboard_debts_view(request):
 def clients_view(request):
     scope = resolve_scope(request.user)
     if request.method == "GET":
-        return Response(ClientSerializer(Client.objects.filter(**scope), many=True).data)
-    serializer = ClientSerializer(data=request.data)
+        return Response(ClientSerializer(Client.objects.filter(**scope), many=True, corporate="organization" in scope).data)
+    serializer = ClientSerializer(data=request.data, corporate="organization" in scope)
     serializer.is_valid(raise_exception=True)
     client = serializer.save(owner=request.user, organization=scope.get("organization"))
-    return Response(ClientSerializer(client).data, status=status.HTTP_201_CREATED)
+    return Response(ClientSerializer(client, corporate="organization" in scope).data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
@@ -349,10 +350,10 @@ def client_detail_view(request, client_id):
         delete_client(client)
         return Response(status=status.HTTP_204_NO_CONTENT)
     if request.method == "PATCH":
-        serializer = ClientSerializer(client, data=request.data, partial=True)
+        serializer = ClientSerializer(client, data=request.data, partial=True, corporate=client.organization_id is not None)
         serializer.is_valid(raise_exception=True)
         client = serializer.save()
-    return Response(ClientSerializer(client).data)
+    return Response(ClientSerializer(client, corporate=client.organization_id is not None).data)
 
 
 @api_view(["GET", "POST"])
@@ -512,8 +513,71 @@ def amortization_schedule_view(request, reference):
     membership = get_membership(request.user)
     if not membership:
         return Response({"detail": "Only corporate accounts can use documents."}, status=status.HTTP_404_NOT_FOUND)
-    debt = Debt.objects.filter(reference=reference, organization=membership.organization).select_related("client").prefetch_related("installments").first()
+    debt = Debt.objects.filter(reference=reference, organization=membership.organization).select_related("client").first()
     if not debt:
         return Response({"detail": "Debt not found."}, status=status.HTTP_404_NOT_FOUND)
-    payload = {"organization": membership.organization, "debt": debt}
-    return Response(AmortizationScheduleSerializer(payload).data)
+    assess_overdue_penalties({"pk": debt.pk})
+    debt.refresh_from_db()
+    return Response(AmortizationScheduleSerializer(amortization_schedule_for_debt(debt)).data)
+
+
+@api_view(["POST"])
+def amortization_simulation_view(request):
+    membership = get_membership(request.user)
+    if not membership:
+        return Response({"detail": "Only corporate accounts can use amortization schedules."}, status=status.HTTP_404_NOT_FOUND)
+    serializer = AmortizationSimulationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    schedule = simulate_amortization_schedule(membership.organization, serializer.validated_data)
+    return Response(AmortizationScheduleSerializer(schedule).data)
+
+
+def _plan_payload(plan, schedule):
+    return {"plan": AmortizationPlanSerializer(plan).data, "schedule": AmortizationScheduleSerializer(schedule).data}
+
+
+@api_view(["GET", "POST"])
+def amortization_plans_view(request):
+    membership = get_membership(request.user)
+    if not membership:
+        return Response({"detail": "Only corporate accounts can use amortization schedules."}, status=status.HTTP_404_NOT_FOUND)
+    if request.method == "GET":
+        plans = AmortizationPlan.objects.filter(organization=membership.organization).select_related("client", "created_by", "debt")
+        client_id = request.query_params.get("clientId")
+        if client_id:
+            if not client_id.isdigit():
+                return Response({"clientId": "Must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+            plans = plans.filter(client_id=int(client_id))
+        return Response(AmortizationPlanSerializer(plans, many=True).data)
+    serializer = AmortizationPlanCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    plan, schedule = save_amortization_plan(request.user, membership.organization, serializer.validated_data)
+    return Response(_plan_payload(plan, schedule), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "DELETE"])
+def amortization_plan_detail_view(request, plan_id):
+    membership = get_membership(request.user)
+    if not membership:
+        return Response({"detail": "Only corporate accounts can use amortization schedules."}, status=status.HTTP_404_NOT_FOUND)
+    plan = (AmortizationPlan.objects.filter(public_id=plan_id, organization=membership.organization)
+            .select_related("client", "created_by", "organization", "debt").first())
+    if not plan:
+        return Response({"detail": "Plan not found."}, status=status.HTTP_404_NOT_FOUND)
+    if request.method == "DELETE":
+        if plan.debt_id:
+            return Response({"detail": "This plan belongs to a loan and is kept for as long as the loan exists."}, status=status.HTTP_400_BAD_REQUEST)
+        plan.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    return Response(_plan_payload(plan, amortization_schedule_for_plan(plan)))
+
+
+@api_view(["POST"])
+def loan_preview_view(request):
+    """Corporate only: the exact schedule a new loan will have, without creating it."""
+    membership = get_membership(request.user)
+    if not membership:
+        return Response({"detail": "Only corporate accounts can preview loans."}, status=status.HTTP_404_NOT_FOUND)
+    serializer = LoanPreviewSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(AmortizationScheduleSerializer(preview_loan_schedule(membership.organization, serializer.validated_data)).data)

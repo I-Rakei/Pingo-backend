@@ -9,7 +9,7 @@ from django.db.models import Exists, F, OuterRef, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from .models import (BalanceNote, Client, CreditNote, Debt, DebtReferenceSequence, DebitNote, DocumentSequence, Installment, Invoice,
+from .models import (AmortizationPlan, BalanceNote, Client, CreditNote, Debt, DebtReferenceSequence, DebitNote, DocumentSequence, Installment, Invoice,
                      Organization, OrganizationMembership, Payment)
 
 MONEY = Decimal("0.01")
@@ -37,6 +37,137 @@ def delete_client(client):
 
 def money(value):
     return Decimal(value).quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def _amortization_rows(principal, loan_type, installments, capital_paid=Decimal("0")):
+    """Present ledger instalments without changing their recorded amounts.
+
+    Multi-period capital is allocated across the stored base amounts. The final
+    row absorbs cent rounding, so the capital column sums to the loan principal.
+    Single loans keep capital separate from their interest-only periods.
+    """
+    rows = []
+    bases = [item["base"] for item in installments]
+    base_total = sum(bases, Decimal("0"))
+    capital_left = principal
+    for index, item in enumerate(installments):
+        base = item["base"]
+        if loan_type == Debt.LoanType.MULTI and base_total:
+            planned_capital = capital_left if index == len(installments) - 1 else money(principal * base / base_total)
+            capital = min(base, planned_capital)
+            capital_left = money(capital_left - capital)
+        else:
+            capital = Decimal("0")
+        amount = item["amount"]
+        paid = item["paid"]
+        rows.append({
+            "number": item["number"], "rowType": "installment", "dueDate": item["dueDate"],
+            "principalAmount": capital, "interestAmount": money(base - capital),
+            "penaltyAmount": item["penalty"], "amount": amount, "paidAmount": paid,
+            "remainingAmount": money(max(amount - paid, 0)),
+            "capitalBalance": capital_left if loan_type == Debt.LoanType.MULTI else money(principal - capital_paid),
+        })
+    if loan_type == Debt.LoanType.SINGLE:
+        rows.append({
+            "number": len(rows) + 1, "rowType": "capital", "dueDate": installments[-1]["dueDate"],
+            "principalAmount": principal, "interestAmount": Decimal("0"),
+            "penaltyAmount": Decimal("0"), "amount": principal,
+            "paidAmount": capital_paid, "remainingAmount": money(max(principal - capital_paid, 0)),
+            "capitalBalance": Decimal("0"),
+        })
+    return rows
+
+
+def _amortization_totals(rows):
+    return {
+        "principalTotal": money(sum((row["principalAmount"] for row in rows), Decimal("0"))),
+        "interestTotal": money(sum((row["interestAmount"] for row in rows), Decimal("0"))),
+        "penaltyTotal": money(sum((row["penaltyAmount"] for row in rows), Decimal("0"))),
+        "scheduleTotal": money(sum((row["amount"] for row in rows), Decimal("0"))),
+    }
+
+
+def amortization_schedule_for_debt(debt):
+    installments = list(debt.installments.all())
+    entries = [{
+        "number": item.number, "dueDate": item.due_date,
+        "base": item.base_amount or money(item.amount - item.penalty_amount),
+        "penalty": item.penalty_amount, "amount": item.amount, "paid": item.paid_amount,
+    } for item in installments]
+    capital_paid = money(max(debt.principal - debt.capital_remaining, 0)) if debt.loan_type == Debt.LoanType.SINGLE else Decimal("0")
+    rows = _amortization_rows(debt.principal, debt.loan_type, entries, capital_paid)
+    return {
+        "organization": debt.organization, "debtId": debt.reference, "clientName": debt.client.name,
+        "loanType": debt.loan_type, "principal": debt.principal, "interestRate": debt.interest_rate,
+        "startDate": debt.start_date, "dueDate": debt.due_date,
+        **_amortization_totals(rows),
+        "collected": debt.collected, "outstanding": debt.outstanding,
+        "installments": rows,
+    }
+
+
+def loan_installment_terms(loan_type, principal, rate, duration, due_date):
+    """The instalments a new loan starts with: (number, due date, amount).
+
+    The single source for create_debt, loan previews and simulations, so a
+    preview is exactly the ledger that creating the loan produces."""
+    interest = money(principal * rate / 100)
+    amount = interest if loan_type == Debt.LoanType.SINGLE else money(money(principal + interest) / duration)
+    return [(number, add_months(due_date, number - duration), amount) for number in range(1, duration + 1)]
+
+
+def _projected_schedule(organization, data, due_date):
+    principal, rate, duration, loan_type = data["principal"], data["interestRate"], data["durationMonths"], data["loanType"]
+    entries = [{"number": number, "dueDate": due, "base": amount, "penalty": Decimal("0"), "amount": amount, "paid": Decimal("0")}
+               for number, due, amount in loan_installment_terms(loan_type, principal, rate, duration, due_date)]
+    rows = _amortization_rows(principal, loan_type, entries)
+    totals = _amortization_totals(rows)
+    return {
+        "organization": organization, "debtId": "", "clientName": data.get("clientName", ""),
+        "loanType": loan_type, "principal": principal, "interestRate": rate,
+        "startDate": data["startDate"], "dueDate": due_date,
+        **totals, "collected": Decimal("0"), "outstanding": totals["scheduleTotal"],
+        "installments": rows,
+    }
+
+
+def simulate_amortization_schedule(organization, data):
+    return _projected_schedule(organization, data, add_months(data["startDate"], data["durationMonths"]))
+
+
+def loan_due_date(data):
+    """Multi-period loans end one term after the start; single loans use the chosen date."""
+    if data["loanType"] == Debt.LoanType.MULTI:
+        return add_months(data["startDate"], data["durationMonths"])
+    return data["dueDate"]
+
+
+def preview_loan_schedule(organization, data):
+    """Schedule of a corporate loan before it is created, built like create_debt builds it."""
+    return _projected_schedule(organization, data, loan_due_date(data))
+
+
+def save_amortization_plan(user, organization, data):
+    try:
+        client = Client.objects.get(pk=data["clientId"], organization=organization)
+    except Client.DoesNotExist as exc:
+        raise ValidationError({"clientId": "Client not found."}) from exc
+    schedule = simulate_amortization_schedule(organization, {**data, "clientName": client.name})
+    plan = AmortizationPlan.objects.create(
+        organization=organization, client=client, created_by=user, loan_type=data["loanType"],
+        principal=data["principal"], interest_rate=data["interestRate"], duration_months=data["durationMonths"],
+        start_date=data["startDate"], schedule_total=schedule["scheduleTotal"])
+    return plan, schedule
+
+
+def amortization_schedule_for_plan(plan):
+    """A loan's plan shows that loan's live ledger schedule; a simulation is recomputed from its terms."""
+    if plan.debt_id:
+        assess_overdue_penalties({"pk": plan.debt_id})
+        return amortization_schedule_for_debt(Debt.objects.select_related("client", "organization").get(pk=plan.debt_id))
+    data = {"clientName": plan.client.name, "loanType": plan.loan_type, "principal": plan.principal,
+            "interestRate": plan.interest_rate, "durationMonths": plan.duration_months, "startDate": plan.start_date}
+    return _projected_schedule(plan.organization, data, plan.due_date or add_months(plan.start_date, plan.duration_months))
 
 
 def get_membership(user):
@@ -110,12 +241,17 @@ def create_debt(owner, data):
     debt = Debt.objects.create(owner=owner, organization=organization, client=client, reference=next_reference(), loan_type=data["loanType"],
         principal=principal, capital_remaining=principal, interest_rate=rate, penalty_rate=data.get("penaltyRate", 0),
         duration_months=duration, total=total, outstanding=total, collected=Decimal("0"), start_date=data["startDate"], due_date=data["dueDate"])
-    for number in range(1, duration + 1):
-        due = add_months(debt.due_date, number - duration)
-        amount = interest if debt.loan_type == Debt.LoanType.SINGLE else money(total / duration)
+    for number, due, amount in loan_installment_terms(debt.loan_type, principal, rate, duration, debt.due_date):
         Installment.objects.create(debt=debt, number=number, due_date=due, base_amount=amount, amount=amount)
     debt.set_status()
     debt.save(update_fields=["status", "updated_at"])
+    if organization:
+        # Corporate loans always carry their amortization plan; personal ledgers are unchanged.
+        schedule = amortization_schedule_for_debt(debt)
+        AmortizationPlan.objects.create(
+            organization=organization, client=client, debt=debt, created_by=owner, loan_type=debt.loan_type,
+            principal=principal, interest_rate=rate, duration_months=duration, start_date=debt.start_date,
+            due_date=debt.due_date, schedule_total=schedule["scheduleTotal"])
     return debt
 
 

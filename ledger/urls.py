@@ -39,5 +39,9 @@ urlpatterns = [
     path("organizations/staff/", views.staff_list_view),
     path("organizations/staff/<int:user_id>/", views.staff_detail_view),
     path("organizations/documents/<str:document_type>/", views.document_list_view),
+    path("organizations/loans/preview/", views.loan_preview_view),
+    path("organizations/amortization-plans/", views.amortization_plans_view),
+    path("organizations/amortization-plans/<uuid:plan_id>/", views.amortization_plan_detail_view),
+    path("organizations/documents/schedule/simulate/", views.amortization_simulation_view),
     path("organizations/documents/schedule/<str:reference>/", views.amortization_schedule_view),
 ]

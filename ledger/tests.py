@@ -13,7 +13,7 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from .models import (BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, MobileSyncBatch,
+from .models import (AmortizationPlan, BalanceNote, Client, CreditNote, Debt, DebitNote, Installment, Invoice, MobileSyncBatch,
                      Organization, OrganizationMembership, Payment, PushDelivery, WebPushSubscription)
 from .password_reset import token_generator
 from .push import send_due_notifications
@@ -734,6 +734,94 @@ class FiscalDocumentApiTests(TestCase):
         self.assertEqual(schedule.status_code, 200, schedule.data)
         self.assertEqual(schedule.data["organization"]["name"], "Doc Corp")
         self.assertEqual(len(schedule.data["installments"]), 2)
+        self.assertEqual(schedule.data["principal"], "100.00")
+        self.assertEqual(schedule.data["scheduleTotal"], "110.00")
+        self.assertEqual([row["principalAmount"] for row in schedule.data["installments"]], ["50.00"] * 2)
+        self.assertEqual([row["interestAmount"] for row in schedule.data["installments"]], ["5.00"] * 2)
+        self.assertEqual([row["dueDate"] for row in schedule.data["installments"]], ["2099-02-01", "2099-03-01"])
+
+    def test_amortization_simulation_uses_ledger_rounding_and_clamped_dates(self):
+        response = self.api.post("/api/organizations/documents/schedule/simulate/", {
+            "clientName": "Ana", "loanType": "multi", "principal": "100.00",
+            "interestRate": "10", "durationMonths": 3, "startDate": "2099-01-31",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        rows = response.data["installments"]
+        self.assertEqual([row["dueDate"] for row in rows], ["2099-02-28", "2099-03-30", "2099-04-30"])
+        self.assertEqual([row["amount"] for row in rows], ["36.67"] * 3)
+        self.assertEqual(sum(Decimal(row["principalAmount"]) for row in rows), Decimal("100.00"))
+        self.assertEqual(sum(Decimal(row["interestAmount"]) for row in rows), Decimal("10.01"))
+        self.assertEqual(rows[-1]["capitalBalance"], "0.00")
+        self.assertEqual(response.data["interestTotal"], "10.01")
+        self.assertEqual(response.data["scheduleTotal"], "110.01")
+        self.assertEqual(Debt.objects.filter(organization=self.organization).count(), 0)
+
+    def test_simulation_totals_above_one_ledger_amount_are_returned(self):
+        response = self.api.post("/api/organizations/documents/schedule/simulate/", {
+            "loanType": "multi", "principal": "900000000000.00", "interestRate": "100",
+            "durationMonths": 12, "startDate": "2099-01-01",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["scheduleTotal"], "1800000000000.00")
+        self.assertEqual(response.data["outstanding"], "1800000000000.00")
+
+    def test_single_loan_simulation_lists_interest_and_separate_capital(self):
+        response = self.api.post("/api/organizations/documents/schedule/simulate/", {
+            "loanType": "single", "principal": "1000.00", "interestRate": "5",
+            "durationMonths": 2, "startDate": "2099-01-15",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        rows = response.data["installments"]
+        self.assertEqual([row["interestAmount"] for row in rows], ["50.00", "50.00", "0.00"])
+        self.assertEqual([row["principalAmount"] for row in rows], ["0.00", "0.00", "1000.00"])
+        self.assertEqual(response.data["scheduleTotal"], "1100.00")
+
+    def test_saved_schedule_uses_recorded_payments_and_single_capital(self):
+        debt = self.api.post("/api/debts/", {
+            "clientId": self.client_id, "loanType": "single", "principal": "1000.00",
+            "interestRate": "5", "durationMonths": 2,
+            "startDate": "2099-01-15", "dueDate": "2099-02-15",
+        }, format="json")
+        self.assertEqual(debt.status_code, 201, debt.data)
+        reference = debt.data["id"]
+        payment = self.api.post(f"/api/debts/{reference}/payments/", {"action": "principal", "amount": "200.00"}, format="json")
+        self.assertEqual(payment.status_code, 200, payment.data)
+        schedule = self.api.get(f"/api/organizations/documents/schedule/{reference}/")
+        self.assertEqual(schedule.status_code, 200, schedule.data)
+        rows = schedule.data["installments"]
+        self.assertEqual(rows[-1]["rowType"], "capital")
+        self.assertEqual(rows[-1]["principalAmount"], "1000.00")
+        self.assertEqual(rows[-1]["paidAmount"], "200.00")
+        self.assertEqual(rows[-1]["remainingAmount"], "800.00")
+        self.assertEqual(schedule.data["outstanding"], "840.00")
+
+    def test_amortization_requires_corporate_membership_and_organization_scope(self):
+        personal = User.objects.create_user(username="personal-schedule@example.com", password="very-secret")
+        personal_api = APIClient()
+        personal_api.force_authenticate(personal)
+        simulation_path = "/api/organizations/documents/schedule/simulate/"
+        self.assertEqual(personal_api.post(simulation_path, {}, format="json").status_code, 404)
+        self.assertEqual(APIClient().post(simulation_path, {}, format="json").status_code, 403)
+        invalid = self.api.post(simulation_path, {
+            "loanType": "multi", "principal": "0", "interestRate": "1",
+            "durationMonths": 2, "startDate": "2099-01-01",
+        }, format="json")
+        self.assertEqual(invalid.status_code, 400)
+        debt = self.api.post("/api/debts/", {
+            "clientId": self.client_id, "loanType": "multi", "principal": "100.00",
+            "interestRate": "0", "durationMonths": 1,
+            "startDate": "2099-01-01", "dueDate": "2099-02-01",
+        }, format="json")
+        reference = debt.data["id"]
+        other_owner = User.objects.create_user(username="other-schedule@example.com", password="very-secret")
+        other_org = Organization.objects.create(name="Other Corp", created_by=other_owner)
+        OrganizationMembership.objects.create(user=other_owner, organization=other_org, role=OrganizationMembership.Role.OWNER)
+        other_api = APIClient()
+        other_api.force_authenticate(other_owner)
+        path = f"/api/organizations/documents/schedule/{reference}/"
+        self.assertEqual(personal_api.get(path).status_code, 404)
+        self.assertEqual(other_api.get(path).status_code, 404)
+        self.assertEqual(APIClient().get(path).status_code, 403)
 
 
 class ClientNotificationApiTests(TestCase):
@@ -799,3 +887,180 @@ class ClientNotificationApiTests(TestCase):
         second = send_due_notifications()
         self.assertEqual(second["clientEmails"], 0)
         self.assertEqual(len(mail.outbox), 0)
+
+
+class ClientDetailsAndAmortizationPlanTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="plans@corp.example.com", email="plans@corp.example.com", password="very-secret")
+        self.organization = Organization.objects.create(name="Plan Corp", created_by=self.owner)
+        OrganizationMembership.objects.create(user=self.owner, organization=self.organization, role=OrganizationMembership.Role.OWNER)
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
+        self.client_id = self.api.post("/api/clients/", {"name": "Fatima"}, format="json").data["id"]
+
+    def plan_terms(self, **overrides):
+        return {"clientId": self.client_id, "loanType": "multi", "principal": "100.00", "interestRate": "10",
+                "durationMonths": 3, "startDate": "2099-01-31", **overrides}
+
+    def test_client_details_are_optional_and_round_trip(self):
+        bare = self.api.post("/api/clients/", {"name": "Only a name"}, format="json")
+        self.assertEqual(bare.status_code, 201, bare.data)
+        self.assertEqual((bare.data["contacts"], bare.data["bankAccounts"], bare.data["idNumber"]), ([], [], ""))
+        response = self.api.post("/api/clients/", {
+            "name": "Ana", "city": "Maputo", "countryOfBirth": "Mozambique", "idNumber": "110100123456A",
+            "altPhone": "+258 84 000 0000", "nuit": "123456789",
+            "contacts": [{"name": "Rui", "relationship": "Brother", "phone": "+258 82 1"}, {"name": " ", "phone": ""}],
+            "bankAccounts": [{"bank": "BCI", "accountNumber": "123", "nib": "000800001234567890123"}],
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        client = Client.objects.get(pk=response.data["id"])
+        self.assertEqual((client.city, client.country_of_birth, client.id_number, client.nuit), ("Maputo", "Mozambique", "110100123456A", "123456789"))
+        self.assertEqual(client.contacts, [{"name": "Rui", "relationship": "Brother", "phone": "+258 82 1", "email": ""}])
+        self.assertEqual(response.data["bankAccounts"][0]["bank"], "BCI")
+        patched = self.api.patch(f"/api/clients/{client.pk}/", {"bankAccounts": []}, format="json")
+        self.assertEqual(patched.status_code, 200, patched.data)
+        self.assertEqual(patched.data["bankAccounts"], [])
+        self.assertEqual(patched.data["contacts"][0]["name"], "Rui")
+
+    def test_client_detail_lists_are_validated(self):
+        for payload in ({"contacts": "Rui"}, {"contacts": ["Rui"]}, {"bankAccounts": [{"bank": 5}]},
+                        {"contacts": [{"name": f"P{index}"} for index in range(11)]}):
+            response = self.api.post("/api/clients/", {"name": "Invalid", **payload}, format="json")
+            self.assertEqual(response.status_code, 400, payload)
+
+    def test_plans_are_saved_listed_reloaded_and_deleted(self):
+        created = self.api.post("/api/organizations/amortization-plans/", self.plan_terms(), format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["plan"]["clientName"], "Fatima")
+        self.assertEqual(created.data["plan"]["scheduleTotal"], "110.01")
+        self.assertEqual(created.data["schedule"]["clientName"], "Fatima")
+        self.assertEqual(len(created.data["schedule"]["installments"]), 3)
+        other_client = self.api.post("/api/clients/", {"name": "Other"}, format="json").data["id"]
+        self.api.post("/api/organizations/amortization-plans/", self.plan_terms(clientId=other_client), format="json")
+        self.assertEqual(len(self.api.get("/api/organizations/amortization-plans/").data), 2)
+        listed = self.api.get(f"/api/organizations/amortization-plans/?clientId={self.client_id}")
+        self.assertEqual([plan["id"] for plan in listed.data], [created.data["plan"]["id"]])
+        path = f"/api/organizations/amortization-plans/{created.data['plan']['id']}/"
+        reloaded = self.api.get(path)
+        self.assertEqual(reloaded.data["schedule"]["installments"], created.data["schedule"]["installments"])
+        self.assertEqual(self.api.delete(path).status_code, 204)
+        self.assertEqual(self.api.get(path).status_code, 404)
+        self.assertEqual(Debt.objects.count(), 0)
+
+    def test_plans_are_scoped_to_corporate_organizations(self):
+        plan_id = self.api.post("/api/organizations/amortization-plans/", self.plan_terms(), format="json").data["plan"]["id"]
+        personal = User.objects.create_user(username="solo-plans@example.com", password="very-secret")
+        personal_api = APIClient(); personal_api.force_authenticate(personal)
+        self.assertEqual(personal_api.get("/api/organizations/amortization-plans/").status_code, 404)
+        other_owner = User.objects.create_user(username="rival@corp.example.com", password="very-secret")
+        other_org = Organization.objects.create(name="Rival", created_by=other_owner)
+        OrganizationMembership.objects.create(user=other_owner, organization=other_org, role=OrganizationMembership.Role.OWNER)
+        other_api = APIClient(); other_api.force_authenticate(other_owner)
+        self.assertEqual(other_api.get("/api/organizations/amortization-plans/").data, [])
+        self.assertEqual(other_api.get(f"/api/organizations/amortization-plans/{plan_id}/").status_code, 404)
+        self.assertEqual(other_api.delete(f"/api/organizations/amortization-plans/{plan_id}/").status_code, 404)
+        foreign = other_api.post("/api/organizations/amortization-plans/", self.plan_terms(), format="json")
+        self.assertEqual(foreign.status_code, 400)
+        self.assertEqual(self.api.get("/api/organizations/amortization-plans/?clientId=abc").status_code, 400)
+
+    def test_deleting_a_client_removes_its_plans(self):
+        self.api.post("/api/organizations/amortization-plans/", self.plan_terms(), format="json")
+        self.assertEqual(self.api.delete(f"/api/clients/{self.client_id}/").status_code, 204)
+        self.assertEqual(self.api.get("/api/organizations/amortization-plans/").data, [])
+
+
+class CorporateLoanAmortizationTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username="loans@corp.example.com", email="loans@corp.example.com", password="very-secret")
+        self.organization = Organization.objects.create(name="Loan Corp", created_by=self.owner)
+        OrganizationMembership.objects.create(user=self.owner, organization=self.organization, role=OrganizationMembership.Role.OWNER)
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
+        self.client_id = self.api.post("/api/clients/", {"name": "Fatima"}, format="json").data["id"]
+
+    def create_from_preview(self, terms):
+        preview = self.api.post("/api/organizations/loans/preview/", terms, format="json")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        created = self.api.post("/api/debts/", {**terms, "clientId": self.client_id, "dueDate": preview.data["dueDate"]}, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        return preview.data, created.data
+
+    def test_multi_period_preview_matches_the_created_loan_and_its_plan(self):
+        preview, debt = self.create_from_preview({"loanType": "multi", "principal": "100.00", "interestRate": "10",
+                                                  "penaltyRate": "5", "durationMonths": 3, "startDate": "2099-01-31"})
+        self.assertEqual(preview["dueDate"], "2099-04-30")
+        self.assertEqual([(item["dueDate"], str(item["amount"])) for item in debt["installments"]],
+                         [(row["dueDate"], row["amount"]) for row in preview["installments"]])
+        plans = self.api.get(f"/api/organizations/amortization-plans/?clientId={self.client_id}").data
+        self.assertEqual(len(plans), 1)
+        self.assertEqual((plans[0]["debtId"], plans[0]["scheduleTotal"], plans[0]["dueDate"]), (debt["id"], preview["scheduleTotal"], "2099-04-30"))
+        schedule = self.api.get(f"/api/organizations/amortization-plans/{plans[0]['id']}/").data["schedule"]
+        self.assertEqual(schedule["debtId"], debt["id"])
+        self.assertEqual(schedule["installments"], preview["installments"])
+        self.assertEqual(self.api.delete(f"/api/organizations/amortization-plans/{plans[0]['id']}/").status_code, 400)
+
+    def test_single_loan_preview_matches_the_created_loan(self):
+        preview, debt = self.create_from_preview({"loanType": "single", "principal": "1000.00", "interestRate": "5",
+                                                  "startDate": "2099-01-15", "dueDate": "2099-03-10"})
+        self.assertEqual([row["rowType"] for row in preview["installments"]], ["installment", "capital"])
+        self.assertEqual(debt["installments"][0]["dueDate"], "2099-03-10")
+        self.assertEqual(preview["scheduleTotal"], "1050.00")
+        plan = self.api.get("/api/organizations/amortization-plans/").data[0]
+        self.assertEqual((plan["debtId"], plan["durationMonths"]), (debt["id"], 1))
+        missing_end = self.api.post("/api/organizations/loans/preview/", {"loanType": "single", "principal": "10", "interestRate": "5",
+                                                                           "startDate": "2099-01-15"}, format="json")
+        self.assertEqual(missing_end.status_code, 400)
+
+    def test_plan_of_a_deleted_loan_remains_as_history(self):
+        _, debt = self.create_from_preview({"loanType": "multi", "principal": "100.00", "interestRate": "10",
+                                            "durationMonths": 2, "startDate": "2099-01-01"})
+        self.assertEqual(self.api.delete(f"/api/debts/{debt['id']}/").status_code, 204)
+        plan = self.api.get("/api/organizations/amortization-plans/").data[0]
+        self.assertEqual(plan["debtId"], "")
+        schedule = self.api.get(f"/api/organizations/amortization-plans/{plan['id']}/").data["schedule"]
+        self.assertEqual([row["dueDate"] for row in schedule["installments"]], ["2099-02-01", "2099-03-01"])
+
+    def test_personal_accounts_are_unchanged(self):
+        personal = User.objects.create_user(username="solo-loans@example.com", password="very-secret")
+        personal_api = APIClient(); personal_api.force_authenticate(personal)
+        solo = personal_api.post("/api/clients/", {"name": "Solo", "idNumber": "123", "bankAccounts": [{"bank": "BCI"}]}, format="json")
+        self.assertEqual(set(solo.data), {"id", "publicId", "name", "phone", "email", "address", "notes", "createdAt", "updatedAt"})
+        self.assertEqual((Client.objects.get(pk=solo.data["id"]).id_number, Client.objects.get(pk=solo.data["id"]).bank_accounts), ("", []))
+        self.assertNotIn("idNumber", personal_api.get("/api/bootstrap/").data["clients"][0])
+        client_id = solo.data["id"]
+        created = personal_api.post("/api/debts/", {"clientId": client_id, "loanType": "multi", "principal": "100.00", "interestRate": "10",
+                                                    "durationMonths": 2, "startDate": "2099-01-01", "dueDate": "2099-03-01"}, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual([str(item["amount"]) for item in created.data["installments"]], ["55.00", "55.00"])
+        self.assertEqual(AmortizationPlan.objects.count(), 0)
+        preview = personal_api.post("/api/organizations/loans/preview/", {"loanType": "multi", "principal": "1", "interestRate": "1",
+                                                                          "durationMonths": 1, "startDate": "2099-01-01"}, format="json")
+        self.assertEqual(preview.status_code, 404)
+
+
+class RouteAuthenticationTests(TestCase):
+    """Every API route needs a signed-in user, except the deliberately public ones below."""
+
+    PUBLIC_ROUTES = {
+        "auth/csrf/", "auth/login/", "auth/register/", "auth/password-reset/", "auth/password-reset/confirm/",
+        "mobile/register/", "mobile/login/", "push/config/", "public/clients/<str:token>/",
+    }
+
+    def test_anonymous_requests_are_rejected_on_every_private_route(self):
+        import uuid
+        from django.urls import URLPattern, get_resolver
+
+        samples = {"int": "1", "uuid": str(uuid.uuid4()), "str": "PNG-1"}
+        routes = [pattern for pattern in get_resolver("ledger.urls").url_patterns if isinstance(pattern, URLPattern)]
+        self.assertGreaterEqual(len(routes), 40)
+        anonymous = APIClient()
+        for pattern in routes:
+            route = str(pattern.pattern)
+            if route in self.PUBLIC_ROUTES:
+                continue
+            path = "/api/" + route
+            for converter, value in samples.items():
+                path = __import__("re").sub(rf"<{converter}:\w+>", value, path)
+            for method in ("get", "post", "patch", "delete"):
+                response = getattr(anonymous, method)(path, {}, format="json")
+                self.assertIn(response.status_code, (401, 403), f"{method.upper()} {path} answered {response.status_code} without sign-in")

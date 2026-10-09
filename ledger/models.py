@@ -95,6 +95,14 @@ class Client(TimeStampedPublicModel):
     email = models.EmailField(blank=True)
     address = models.CharField(max_length=255, blank=True)
     notes = models.TextField(blank=True)
+    # Web-only details; mobile sync never writes these fields.
+    city = models.CharField(max_length=120, blank=True)
+    country_of_birth = models.CharField(max_length=120, blank=True)
+    id_number = models.CharField(max_length=60, blank=True)
+    alt_phone = models.CharField(max_length=40, blank=True)
+    nuit = models.CharField(max_length=40, blank=True)
+    contacts = models.JSONField(default=list, blank=True)
+    bank_accounts = models.JSONField(default=list, blank=True)
     mobile_device = models.ForeignKey("MobileDevice", on_delete=models.SET_NULL, null=True, blank=True, related_name="clients")
     mobile_local_id = models.CharField(max_length=128, blank=True)
     share_token = models.CharField(max_length=64, unique=True, null=True, blank=True, db_index=True)
@@ -375,3 +383,23 @@ class BalanceNote(FiscalDocument):
 
     class Meta(FiscalDocument.Meta):
         constraints = [models.UniqueConstraint(fields=["organization", "number"], name="unique_org_balance_note_number")]
+
+
+class AmortizationPlan(TimeStampedPublicModel):
+    """A saved amortization simulation. Projection only: never a ledger row, never synced."""
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="amortization_plans")
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="amortization_plans")
+    # Set when the plan was created together with a loan; the loan's ledger then drives its schedule.
+    debt = models.ForeignKey(Debt, on_delete=models.SET_NULL, null=True, blank=True, related_name="amortization_plans")
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    loan_type = models.CharField(max_length=8, choices=Debt.LoanType.choices)
+    principal = models.DecimalField(max_digits=14, decimal_places=2)
+    interest_rate = models.DecimalField(max_digits=7, decimal_places=2)
+    duration_months = models.PositiveIntegerField()
+    start_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    schedule_total = models.DecimalField(max_digits=18, decimal_places=2)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
