@@ -11,10 +11,21 @@ from rest_framework import serializers, status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
-from . import pdf_documents, pdf_store
+from . import pdf_store
 from .models import AmortizationPlan
+from .pdf_store import DocumentNotFound
 from .serializers import AmortizationSimulationSerializer
 from .services import get_membership
+
+# The PDF renderer (and its ReportLab dependency) is imported only when a document is actually requested,
+# so a missing or broken PDF library can never stop the rest of the API from starting.
+FISCAL_TYPES = ("invoice", "debit_note", "credit_note", "balance_note")
+
+
+def _documents():
+    from . import pdf_documents
+    return pdf_documents
+
 
 LANGUAGE = serializers.ChoiceField(choices=["en", "pt"], required=False)
 
@@ -28,7 +39,7 @@ class DebtDocumentRequest(serializers.Serializer):
 
 
 class FiscalDocumentRequest(serializers.Serializer):
-    type = serializers.ChoiceField(choices=list(pdf_documents.FISCAL_MODELS))
+    type = serializers.ChoiceField(choices=list(FISCAL_TYPES))
     number = serializers.IntegerField(min_value=1)
     language = LANGUAGE
 
@@ -68,10 +79,10 @@ def debt_pdf_view(request):
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
     try:
-        generated = pdf_documents.debt_document(
+        generated = _documents().debt_document(
             request.user, data["reference"], kind=data.get("kind"), payment_id=data.get("paymentId"),
             installment_number=data.get("installmentNumber"), language=data.get("language"))
-    except pdf_documents.DocumentNotFound as error:
+    except DocumentNotFound as error:
         return _not_found(error)
     return _respond(request.user, generated)
 
@@ -82,8 +93,8 @@ def fiscal_pdf_view(request):
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
     try:
-        generated = pdf_documents.fiscal_document(request.user, data["type"], data["number"], language=data.get("language"))
-    except pdf_documents.DocumentNotFound as error:
+        generated = _documents().fiscal_document(request.user, data["type"], data["number"], language=data.get("language"))
+    except DocumentNotFound as error:
         return _not_found(error)
     return _respond(request.user, generated)
 
@@ -106,9 +117,9 @@ def schedule_pdf_view(request):
     if terms is not None:
         terms = {**terms, "clientName": terms.get("clientName", "")}
     try:
-        generated = pdf_documents.schedule_document(
+        generated = _documents().schedule_document(
             request.user, data["source"], reference=data.get("reference"), plan=plan, terms=terms, language=data.get("language"))
-    except pdf_documents.DocumentNotFound as error:
+    except DocumentNotFound as error:
         return _not_found(error)
     return _respond(request.user, generated)
 

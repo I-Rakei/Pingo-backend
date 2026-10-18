@@ -3,12 +3,15 @@
 import base64
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 import zlib
 from io import StringIO
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -212,6 +215,24 @@ class CorporateDocumentTests(PdfTestCase):
         _, personal = self.user_api("solo@example.com")
         self.generate(personal, "/api/pdf/schedule/", {"source": "recorded", "reference": self.reference}, expected=404)
         self.generate(personal, "/api/pdf/fiscal/", {"type": "invoice", "number": 1}, expected=404)
+
+
+class MissingPdfLibraryTests(TestCase):
+    def test_the_api_still_starts_when_the_pdf_library_is_not_installed(self):
+        """A server that pulled this code before running `pip install` must keep serving everything else."""
+        code = (
+            "import sys; sys.modules['reportlab'] = None\n"
+            "import django; django.setup()\n"
+            "import ledger.urls\n"
+            "from django.urls import resolve\n"
+            "assert resolve('/api/auth/csrf/').func is not None\n"
+            "assert resolve('/api/pdf/debt/').func is not None\n"
+            "print('urls import without reportlab')\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(settings.BASE_DIR),
+                                env={**os.environ, "DJANGO_SETTINGS_MODULE": "config.settings"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("urls import without reportlab", result.stdout)
 
 
 class PdfStorageAndCleanupTests(PdfTestCase):

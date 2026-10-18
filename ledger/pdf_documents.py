@@ -15,6 +15,7 @@ from django.utils import timezone
 from . import pdf_text
 from .models import BalanceNote, CreditNote, DebitNote, Debt, Invoice, Preference
 from .pdf_render import BRAND, CONTENT_WIDTH, INK, MARGIN, MUTED, RIGHT, STATUS, PdfPage
+from .pdf_store import DocumentNotFound  # noqa: F401  (re-exported for callers of this module)
 from .services import (
     amortization_schedule_for_debt, amortization_schedule_for_plan, assess_overdue_penalties,
     get_membership, money, resolve_scope, simulate_amortization_schedule,
@@ -22,10 +23,6 @@ from .services import (
 
 FISCAL_MODELS = {"invoice": Invoice, "debit_note": DebitNote, "credit_note": CreditNote, "balance_note": BalanceNote}
 FISCAL_PREFIX = {"invoice": "FT", "debit_note": "ND", "credit_note": "NC", "balance_note": "NS"}
-
-
-class DocumentNotFound(Exception):
-    """The requested record does not exist in the caller's ledger."""
 
 
 @dataclass

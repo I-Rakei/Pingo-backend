@@ -12,6 +12,10 @@ from pathlib import Path
 
 from django.conf import settings
 
+class DocumentNotFound(Exception):
+    """The requested record does not exist in the caller's ledger."""
+
+
 # Characters kept in the stored file name; the real, display file name travels in the API response.
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
