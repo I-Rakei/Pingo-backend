@@ -1,9 +1,14 @@
 from django.urls import path
 
+from . import pdf_views
 from . import views
 from . import sync_v2_views
 
 urlpatterns = [
+    path("pdf/debt/", pdf_views.debt_pdf_view),
+    path("pdf/fiscal/", pdf_views.fiscal_pdf_view),
+    path("pdf/schedule/", pdf_views.schedule_pdf_view),
+    path("pdf/files/<uuid:file_id>/", pdf_views.pdf_file_view),
     path("sync/v2/config/", sync_v2_views.config_view),
     path("sync/v2/hello/", sync_v2_views.hello_view),
     path("sync/v2/changes/", sync_v2_views.changes_view),

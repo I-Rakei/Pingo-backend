@@ -447,6 +447,10 @@ integer database ID. Sync identities are UUID strings.
 | POST | `/api/sync/v2/push/` | Apply an idempotent grouped mutation |
 | GET, POST, DELETE | `/api/push/subscription/` | Manage browser subscriptions |
 | POST | `/api/push/test/` | Send a test browser notification |
+| POST | `/api/pdf/debt/` | Generate an invoice or receipt PDF for a debt (`reference`, optional `kind`, `paymentId`, `installmentNumber`, `language`) |
+| POST | `/api/pdf/fiscal/` | Generate a fiscal document PDF (corporate): `type`, `number` |
+| POST | `/api/pdf/schedule/` | Generate an amortization schedule PDF (corporate): `source` is `recorded`, `plan` or `simulation` |
+| GET | `/api/pdf/files/<id>/` | Download a generated PDF; only the account that generated it can fetch it |
 
 `/api/bootstrap/` returns the signed-in user, preferences, clients, debts,
 installments embedded with debts, and active payments. The web app treats this as
@@ -1174,6 +1178,27 @@ per-installment overdue cadence. Client email tests cover web and both mobile
 protocols, duplicate syncs, settlement/re-payment, the 30-day interval, rollback,
 deleted records, SMTP retries, stale claims, and combined payment receipts.
 All 117 ledger tests passed locally; production deployment has not been performed.
+
+## 15a. PDF documents
+
+Invoices, receipts, fiscal notes and amortization schedules are built on the server (ReportLab), never in
+the browser, so a PDF is always produced from the ledger rows and cannot disagree with the system. The
+web app (`frontend/src/lib/documents.js`) asks for a document, then downloads the file it is pointed to.
+The phone still builds its own invoices locally (`Dividas/lib/invoice.ts`) because it works offline.
+
+- Code: `ledger/pdf_documents.py` (what each document contains, scoped to the caller like the API),
+  `pdf_render.py` (A4 layout), `pdf_text.py` (English and Mozambican Portuguese wording, number and date
+  formats), `pdf_store.py` (storage), `pdf_views.py` (endpoints).
+- Storage: `GENERATED_PDF_DIR` (default `backend/generated_pdfs/`, git-ignored), one folder per user.
+  A download only looks inside the caller's own folder.
+- Cleanup: `run_notification_worker` (the `pingo-notifications` PM2 process) runs
+  `cleanup_generated_pdfs` every 10 minutes, deleting files older than `GENERATED_PDF_TTL_SECONDS`
+  (default 300). The command can also be run by hand or from cron: `manage.py cleanup_generated_pdfs [--max-age N]`.
+- Deploying: `pip install -r requirements.txt` (adds `reportlab`), then restart `pingo-api` and
+  `pingo-notifications` so the worker starts sweeping.
+- Equal-period loans use whole-number instalments with the remainder on the last one
+  (`services.equal_period_amounts`, mirrored by `Dividas/lib/equal-period-amounts.ts`). Older debts can be
+  brought in line with `manage.py repair_installment_rounding` (dry-run unless `--apply`).
 
 Push troubleshooting order:
 

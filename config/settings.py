@@ -99,5 +99,10 @@ if EMAIL_USE_SSL:
     EMAIL_USE_TLS = False
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "Pingo <no-reply@pingo.local>")
 
+# Generated PDFs are written here, downloaded straight away, and swept by the notification worker
+# (every 10 minutes it deletes files older than GENERATED_PDF_TTL_SECONDS).
+GENERATED_PDF_DIR = Path(os.getenv("GENERATED_PDF_DIR") or BASE_DIR / "generated_pdfs")
+GENERATED_PDF_TTL_SECONDS = int(os.getenv("GENERATED_PDF_TTL_SECONDS", "300"))
+
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", str(BASE_DIR / ".secrets" / "vapid_private.pem"))
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:admin@pingo.local")
