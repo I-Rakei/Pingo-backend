@@ -1,4 +1,4 @@
-"""Equal-period schedules must add up to the debt total to the cent."""
+"""Equal-period schedules use whole-number instalments and still add up to the debt total to the cent."""
 
 from datetime import date
 from decimal import Decimal
@@ -9,7 +9,7 @@ from django.core.management import call_command
 from django.test import TestCase
 
 from ledger.models import Debt, Installment, Payment
-from ledger.services import create_debt, loan_installment_terms, money, reconcile_debt
+from ledger.services import create_debt, equal_period_amounts, loan_installment_terms, money, reconcile_debt
 
 
 def amounts(loan_type, principal, rate, duration):
@@ -23,23 +23,37 @@ def new_debt(owner, name="Estrela David"):
     })
 
 
-class InstallmentRoundingTests(TestCase):
+class WholeNumberInstalmentTests(TestCase):
     def test_seven_thousand_at_thirty_percent_over_three_months(self):
-        # 9100.00 / 3 = 3033.333...: the invoice used to show 3 x 3033.33 = 9099.99.
-        self.assertEqual(amounts(Debt.LoanType.MULTI, "7000", "30", 3), [Decimal("3033.33"), Decimal("3033.33"), Decimal("3033.34")])
+        # 9100.00 / 3 = 3033.333...: whole-number instalments, the last one takes the remainder.
+        self.assertEqual(amounts(Debt.LoanType.MULTI, "7000", "30", 3), [Decimal("3033.00"), Decimal("3033.00"), Decimal("3034.00")])
+
+    def test_split_examples(self):
+        self.assertEqual(equal_period_amounts(Decimal("110.00"), 3), [Decimal("36.00"), Decimal("36.00"), Decimal("38.00")])
+        self.assertEqual(equal_period_amounts(Decimal("1000"), 4), [Decimal("250.00")] * 4)
+        self.assertEqual(equal_period_amounts(Decimal("100"), 1), [Decimal("100.00")])
+        # A total with cents keeps them, on the last instalment only.
+        self.assertEqual(equal_period_amounts(Decimal("9100.50"), 3), [Decimal("3033.00"), Decimal("3033.00"), Decimal("3034.50")])
+
+    def test_tiny_totals_fall_back_to_cents_instead_of_zero_instalments(self):
+        schedule = equal_period_amounts(Decimal("2.00"), 3)
+        self.assertEqual(schedule, [Decimal("0.67"), Decimal("0.67"), Decimal("0.66")])
+        self.assertEqual(sum(schedule), Decimal("2.00"))
 
     def test_schedule_always_sums_to_principal_plus_interest(self):
         for principal, rate, duration in [("7000", "30", 3), ("100", "10", 3), ("1000", "7", 7), ("250.50", "12.5", 6),
-                                          ("99.99", "3", 11), ("100", "10", 1), ("5", "0", 3)]:
+                                          ("99.99", "3", 11), ("100", "10", 1), ("5", "0", 3), ("12345.67", "17.5", 9)]:
             total = money(Decimal(principal) + money(Decimal(principal) * Decimal(rate) / 100))
             schedule = amounts(Debt.LoanType.MULTI, principal, rate, duration)
             self.assertEqual(len(schedule), duration)
             self.assertEqual(sum(schedule), total, (principal, rate, duration, schedule))
-            # Only the last period differs, and only by a few cents.
             self.assertTrue(all(amount == schedule[0] for amount in schedule[:-1]))
-            self.assertLessEqual(abs(schedule[-1] - schedule[0]), Decimal("0.05"))
+            if total >= duration:
+                self.assertEqual(schedule[0], schedule[0].to_integral_value(), "instalments are whole numbers")
+                self.assertGreaterEqual(schedule[-1], schedule[0])
+                self.assertLess(schedule[-1] - schedule[0], duration + 1)
 
-    def test_single_loans_keep_one_interest_amount_per_period(self):
+    def test_single_loans_keep_one_exact_interest_amount_per_period(self):
         self.assertEqual(amounts(Debt.LoanType.SINGLE, "18500", "8", 1), [Decimal("1480.00")])
 
     def test_created_debt_keeps_its_total_after_reconciling(self):
@@ -49,19 +63,20 @@ class InstallmentRoundingTests(TestCase):
         debt.refresh_from_db()
         self.assertEqual(debt.total, Decimal("9100.00"))
         self.assertEqual(debt.outstanding, Decimal("9100.00"))
-        self.assertEqual(sum(item.amount for item in debt.installments.all()), Decimal("9100.00"))
+        self.assertEqual([item.amount for item in debt.installments.order_by("number")], [Decimal("3033.00"), Decimal("3033.00"), Decimal("3034.00")])
 
 
 class RepairInstallmentRoundingTests(TestCase):
     def setUp(self):
         self.owner = User.objects.create_user("repair@example.com", "repair@example.com", "password-123")
 
-    def short_debt(self, name="Estrela David"):
-        """A debt as created before the fix: three instalments of 3033.33 against a total of 9100.00."""
+    def old_style_debt(self, name="Estrela David"):
+        """A debt as created before the change: three instalments of 3033.33 against 9100.00."""
         debt = new_debt(self.owner, name)
-        last = debt.installments.order_by("number").last()
-        last.base_amount = last.amount = Decimal("3033.33")
-        last.save(update_fields=["base_amount", "amount", "updated_at"])
+        for item in debt.installments.all():
+            item.base_amount = item.amount = Decimal("3033.33")
+            item.save(update_fields=["base_amount", "amount", "updated_at"])
+        reconcile_debt(debt)
         return debt
 
     def run_command(self, *args):
@@ -69,30 +84,41 @@ class RepairInstallmentRoundingTests(TestCase):
         call_command("repair_installment_rounding", *args, stdout=out)
         return out.getvalue()
 
+    def amounts_of(self, debt):
+        return [item.amount for item in debt.installments.order_by("number")]
+
     def test_dry_run_changes_nothing(self):
-        debt = self.short_debt()
+        debt = self.old_style_debt()
         output = self.run_command()
         self.assertIn("Would repair 1 debt(s)", output)
-        self.assertEqual(debt.installments.order_by("number").last().amount, Decimal("3033.33"))
+        self.assertEqual(self.amounts_of(debt), [Decimal("3033.33")] * 3)
 
-    def test_apply_moves_the_missing_cent_onto_the_last_period(self):
-        debt = self.short_debt()
-        output = self.run_command("--apply")
-        self.assertIn("Repaired 1 debt(s)", output)
+    def test_a_debt_without_payments_gets_whole_number_instalments(self):
+        debt = self.old_style_debt()
+        self.assertIn("Repaired 1 debt(s)", self.run_command("--apply"))
         debt.refresh_from_db()
-        self.assertEqual([item.amount for item in debt.installments.order_by("number")],
-                         [Decimal("3033.33"), Decimal("3033.33"), Decimal("3033.34")])
+        self.assertEqual(self.amounts_of(debt), [Decimal("3033.00"), Decimal("3033.00"), Decimal("3034.00")])
         self.assertEqual(debt.total, Decimal("9100.00"))
         self.assertEqual(debt.outstanding, Decimal("9100.00"))
-        # Running it again finds nothing left to do.
         self.assertIn("Repaired 0 debt(s)", self.run_command("--apply"))
 
-    def test_a_debt_whose_last_period_is_paid_is_left_alone(self):
-        debt = self.short_debt()
-        last = debt.installments.order_by("number").last()
-        Payment.objects.create(owner=self.owner, debt=debt, client=debt.client, installment=last, amount=Decimal("3033.33"),
+    def test_a_debt_with_payments_only_gets_the_rounding_gap_fixed(self):
+        debt = self.old_style_debt()
+        first = debt.installments.order_by("number").first()
+        Payment.objects.create(owner=self.owner, debt=debt, client=debt.client, installment=first, amount=Decimal("3033.33"),
                                payment_type="principal", payment_date=date(2099, 1, 2))
+        reconcile_debt(debt)
+        self.assertIn("Repaired 1 debt(s)", self.run_command("--apply"))
+        debt.refresh_from_db()
+        self.assertEqual(self.amounts_of(debt), [Decimal("3033.33"), Decimal("3033.33"), Decimal("3033.34")])
+        self.assertEqual(debt.outstanding, Decimal("6066.67"))
+
+    def test_a_debt_whose_last_period_is_paid_is_left_alone(self):
+        debt = self.old_style_debt()
+        for item in debt.installments.all():
+            Payment.objects.create(owner=self.owner, debt=debt, client=debt.client, installment=item, amount=Decimal("3033.33"),
+                                   payment_type="principal", payment_date=date(2099, 1, 2))
         reconcile_debt(debt)
         output = self.run_command("--apply")
         self.assertIn("last period already paid", output)
-        self.assertEqual(Installment.objects.get(pk=last.pk).amount, Decimal("3033.33"))
+        self.assertEqual(Installment.objects.filter(debt=debt, amount=Decimal("3033.33")).count(), 3)

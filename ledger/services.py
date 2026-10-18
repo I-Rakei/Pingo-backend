@@ -1,7 +1,7 @@
 import calendar
 import secrets
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from django.contrib.auth.models import User
 from django.db import IntegrityError, transaction
@@ -106,6 +106,19 @@ def amortization_schedule_for_debt(debt):
     }
 
 
+def equal_period_amounts(total, duration):
+    """Split a total into `duration` instalments of whole currency units.
+
+    Every instalment but the last is the whole-unit amount below the exact share, and the last one
+    takes whatever is left, cents included. The arithmetic stays in exact decimals, so the instalments
+    always add up to the total to the cent: 9100.00 over 3 periods is 3033 + 3033 + 3034.
+    A total too small for whole units (under one unit per period) falls back to cents."""
+    total = money(total)
+    share = (total / duration).to_integral_value(rounding=ROUND_FLOOR)
+    base = money(share) if share >= 1 else money(total / duration)
+    return [base] * (duration - 1) + [money(total - base * (duration - 1))]
+
+
 def loan_installment_terms(loan_type, principal, rate, duration, due_date):
     """The instalments a new loan starts with: (number, due date, amount).
 
@@ -115,12 +128,7 @@ def loan_installment_terms(loan_type, principal, rate, duration, due_date):
     if loan_type == Debt.LoanType.SINGLE:
         amounts = [interest] * duration
     else:
-        total = money(principal + interest)
-        base = money(total / duration)
-        # Equal periods are rounded to cents, so the last one absorbs the remainder:
-        # the schedule then sums to exactly the debt total (9100.00 over 3 periods is
-        # 3033.33 + 3033.33 + 3033.34, not 9099.99).
-        amounts = [base] * (duration - 1) + [money(total - base * (duration - 1))]
+        amounts = equal_period_amounts(money(principal + interest), duration)
     return [(number, add_months(due_date, number - duration), amounts[number - 1]) for number in range(1, duration + 1)]
 
 

@@ -748,8 +748,8 @@ class FiscalDocumentApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         rows = response.data["installments"]
         self.assertEqual([row["dueDate"] for row in rows], ["2099-02-28", "2099-03-30", "2099-04-30"])
-        # 110.00 over three periods: the last one absorbs the cent lost to rounding.
-        self.assertEqual([row["amount"] for row in rows], ["36.67", "36.67", "36.66"])
+        # 110.00 over three periods in whole numbers: the last one absorbs the remainder.
+        self.assertEqual([row["amount"] for row in rows], ["36.00", "36.00", "38.00"])
         self.assertEqual(sum(Decimal(row["amount"]) for row in rows), Decimal("110.00"))
         self.assertEqual(sum(Decimal(row["principalAmount"]) for row in rows), Decimal("100.00"))
         self.assertEqual(sum(Decimal(row["interestAmount"]) for row in rows), Decimal("10.00"))

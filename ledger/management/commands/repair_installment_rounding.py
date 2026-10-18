@@ -4,7 +4,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from ledger.models import Debt
-from ledger.services import money, reconcile_debt
+from ledger.services import equal_period_amounts, money, reconcile_debt
 
 
 def base_of(installment):
@@ -12,9 +12,10 @@ def base_of(installment):
 
 
 class Command(BaseCommand):
-    help = ("Equal-period loans created before the rounding fix have instalments that add up to a few cents "
-            "less (or more) than the debt total. Move that difference onto the last instalment, as new loans do. "
-            "Read-only unless --apply is given.")
+    help = ("Bring equal-period loans created before the whole-number rule in line with new loans. "
+            "A debt with no payments yet gets the same whole-number instalments a new loan would. A debt that "
+            "already has payments keeps its instalments, and only a rounding difference is moved onto its last "
+            "unpaid instalment, so the schedule adds up to principal plus interest. Read-only unless --apply is given.")
 
     def add_arguments(self, parser):
         parser.add_argument("--apply", action="store_true", help="Save the corrections.")
@@ -30,30 +31,40 @@ class Command(BaseCommand):
             # reconcile_debt() sets a multi-period total to the sum of its instalments, so the stored
             # total drifts along with a short schedule. Compare with what the terms say it should be.
             expected = money(debt.principal + money(debt.principal * debt.interest_rate / 100))
-            gap = money(expected - sum((base_of(period) for period in periods), Decimal("0")))
-            if gap == 0:
-                continue
             label = f"{debt.reference} ({debt.client.name}, owner {debt.owner_id})"
-            last = periods[-1]
-            # Rounding can only ever explain a fraction of a cent per period.
-            if abs(gap) > Decimal("0.01") * len(periods):
-                skipped += 1
-                self.stdout.write(self.style.WARNING(f"{label}: gap {gap} is larger than rounding; left alone."))
-                continue
-            if last.paid_amount >= last.amount:
-                skipped += 1
-                self.stdout.write(self.style.WARNING(f"{label}: last period already paid; gap {gap} left alone."))
-                continue
-            before = (debt.outstanding, last.amount)
+            before = [period.amount for period in periods]
+
+            if all(period.paid_amount == 0 for period in periods):
+                target = equal_period_amounts(expected, len(periods))
+                if [base_of(period) for period in periods] == target:
+                    continue
+                changes = [(period, new) for period, new in zip(periods, target) if base_of(period) != new]
+            else:
+                gap = money(expected - sum((base_of(period) for period in periods), Decimal("0")))
+                if gap == 0:
+                    continue
+                last = periods[-1]
+                # Rounding can only ever explain a fraction of a cent per period.
+                if abs(gap) > Decimal("0.01") * len(periods):
+                    skipped += 1
+                    self.stdout.write(self.style.WARNING(f"{label}: gap {gap} is larger than rounding; left alone."))
+                    continue
+                if last.paid_amount >= last.amount:
+                    skipped += 1
+                    self.stdout.write(self.style.WARNING(f"{label}: last period already paid; gap {gap} left alone."))
+                    continue
+                changes = [(last, base_of(last) + gap)]
+
             with transaction.atomic():
-                last.base_amount = base_of(last) + gap
-                last.amount = money(last.amount + gap)
-                last.save(update_fields=["base_amount", "amount", "updated_at"])
+                for period, new_base in changes:
+                    period.base_amount = new_base
+                    period.amount = money(new_base + period.penalty_amount)
+                    period.save(update_fields=["base_amount", "amount", "updated_at"])
                 reconcile_debt(debt)
-                debt.refresh_from_db()
+                after = [period.amount for period in debt.installments.order_by("number")]
                 if not options["apply"]:
                     transaction.set_rollback(True)
             fixed += 1
-            self.stdout.write(f"{label}: period {last.number} {before[1]} -> {last.amount}; outstanding {before[0]} -> {debt.outstanding if options['apply'] else money(before[0] + gap)}")
+            self.stdout.write(f"{label}: instalments {[str(amount) for amount in before]} -> {[str(amount) for amount in after]}")
         verb = "Repaired" if options["apply"] else "Would repair"
         self.stdout.write(self.style.SUCCESS(f"{verb} {fixed} debt(s); {skipped} left alone."))
