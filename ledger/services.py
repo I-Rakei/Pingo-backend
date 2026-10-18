@@ -112,8 +112,16 @@ def loan_installment_terms(loan_type, principal, rate, duration, due_date):
     The single source for create_debt, loan previews and simulations, so a
     preview is exactly the ledger that creating the loan produces."""
     interest = money(principal * rate / 100)
-    amount = interest if loan_type == Debt.LoanType.SINGLE else money(money(principal + interest) / duration)
-    return [(number, add_months(due_date, number - duration), amount) for number in range(1, duration + 1)]
+    if loan_type == Debt.LoanType.SINGLE:
+        amounts = [interest] * duration
+    else:
+        total = money(principal + interest)
+        base = money(total / duration)
+        # Equal periods are rounded to cents, so the last one absorbs the remainder:
+        # the schedule then sums to exactly the debt total (9100.00 over 3 periods is
+        # 3033.33 + 3033.33 + 3033.34, not 9099.99).
+        amounts = [base] * (duration - 1) + [money(total - base * (duration - 1))]
+    return [(number, add_months(due_date, number - duration), amounts[number - 1]) for number in range(1, duration + 1)]
 
 
 def _projected_schedule(organization, data, due_date):

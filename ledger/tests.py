@@ -748,12 +748,14 @@ class FiscalDocumentApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         rows = response.data["installments"]
         self.assertEqual([row["dueDate"] for row in rows], ["2099-02-28", "2099-03-30", "2099-04-30"])
-        self.assertEqual([row["amount"] for row in rows], ["36.67"] * 3)
+        # 110.00 over three periods: the last one absorbs the cent lost to rounding.
+        self.assertEqual([row["amount"] for row in rows], ["36.67", "36.67", "36.66"])
+        self.assertEqual(sum(Decimal(row["amount"]) for row in rows), Decimal("110.00"))
         self.assertEqual(sum(Decimal(row["principalAmount"]) for row in rows), Decimal("100.00"))
-        self.assertEqual(sum(Decimal(row["interestAmount"]) for row in rows), Decimal("10.01"))
+        self.assertEqual(sum(Decimal(row["interestAmount"]) for row in rows), Decimal("10.00"))
         self.assertEqual(rows[-1]["capitalBalance"], "0.00")
-        self.assertEqual(response.data["interestTotal"], "10.01")
-        self.assertEqual(response.data["scheduleTotal"], "110.01")
+        self.assertEqual(response.data["interestTotal"], "10.00")
+        self.assertEqual(response.data["scheduleTotal"], "110.00")
         self.assertEqual(Debt.objects.filter(organization=self.organization).count(), 0)
 
     def test_simulation_totals_above_one_ledger_amount_are_returned(self):
@@ -932,7 +934,7 @@ class ClientDetailsAndAmortizationPlanTests(TestCase):
         created = self.api.post("/api/organizations/amortization-plans/", self.plan_terms(), format="json")
         self.assertEqual(created.status_code, 201, created.data)
         self.assertEqual(created.data["plan"]["clientName"], "Fatima")
-        self.assertEqual(created.data["plan"]["scheduleTotal"], "110.01")
+        self.assertEqual(created.data["plan"]["scheduleTotal"], "110.00")
         self.assertEqual(created.data["schedule"]["clientName"], "Fatima")
         self.assertEqual(len(created.data["schedule"]["installments"]), 3)
         other_client = self.api.post("/api/clients/", {"name": "Other"}, format="json").data["id"]
