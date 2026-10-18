@@ -15,6 +15,10 @@ from .models import Client, Debt, Installment, OrganizationMembership, Payment, 
 
 logger = logging.getLogger(__name__)
 _last_broadcast_error = 0.0
+# After a failed broadcast, skip further ones for this long. An unreachable Redis
+# then costs one connect timeout instead of one per ledger write.
+BROADCAST_PAUSE_SECONDS = 30
+_broadcast_paused_until = 0.0
 SYNC_MODELS = {Client: "client", Debt: "debt", Installment: "installment", Payment: "payment"}
 _origin = ContextVar("pingo_sync_origin", default=(None, None))
 
@@ -87,6 +91,8 @@ def notify_scope(scope, first_id, last_id):
         from channels.layers import get_channel_layer
     except ImportError:
         return
+    if time.monotonic() < _broadcast_paused_until:
+        return
     try:
         layer = get_channel_layer()
         if layer is None:
@@ -100,14 +106,16 @@ def notify_scope(scope, first_id, last_id):
 def _log_broadcast_error(exc):
     # Redis outages must never fail an HTTP write. One warning per minute keeps
     # a bulk import or test run from producing thousands of identical traces.
-    global _last_broadcast_error
+    global _last_broadcast_error, _broadcast_paused_until
     now = time.monotonic()
+    _broadcast_paused_until = now + BROADCAST_PAUSE_SECONDS
     if now - _last_broadcast_error > 60:
         logger.warning("Could not broadcast realtime event: %s", exc)
         _last_broadcast_error = now
 
 
 def notify_auth_revoked(user_id):
+    # Rare and security-relevant, so it always tries even while ledger broadcasts are paused.
     try:
         from asgiref.sync import async_to_sync
         from channels.layers import get_channel_layer

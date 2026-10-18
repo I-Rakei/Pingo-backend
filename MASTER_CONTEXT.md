@@ -206,12 +206,22 @@ DJANGO_SECRET_KEY=replace-with-a-long-random-value
 DJANGO_DEBUG=false
 DJANGO_ALLOWED_HOSTS=*
 CORS_ALLOWED_ORIGINS=https://pingo.rakei.co.za
-REDIS_URL=redis://127.0.0.1:6379/0
+# REDIS_URL=redis://127.0.0.1:6379/0   (optional, see below)
 PINGO_MOBILE_V2_ENABLED=false
 TIME_ZONE=Africa/Johannesburg
 VAPID_PRIVATE_KEY=.secrets/vapid_private.pem
 VAPID_SUBJECT=mailto:admin@example.com
 ```
+
+`REDIS_URL` is optional. When it is unset, the Channels layer and the websocket
+socket-count cache are in memory (`InMemoryChannelLayer`, `LocMemCache`), which is
+correct for local development and for a single process. When it is set, both use
+Redis with a 1 second connect timeout. Set it before running more than one ASGI
+worker, since in-memory state is per process. A failed realtime broadcast pauses
+further broadcasts for 30 seconds (`sync_log.BROADCAST_PAUSE_SECONDS`) so an
+unreachable Redis costs one timeout, not one per write. While `DJANGO_DEBUG=true`
+and `CORS_ALLOWED_ORIGINS` is empty, both `http://localhost:5173` and
+`http://127.0.0.1:5173` are allowed; origins are otherwise matched exactly.
 
 The deployment currently prefers `DJANGO_ALLOWED_HOSTS=*` because it is private
 use behind a tunnel. That works, but it broadens the accepted Host header surface.
@@ -865,9 +875,17 @@ testing browser push:
 .\.venv\Scripts\python manage.py generate_vapid_keys
 ```
 
-For WebSocket testing, start a local Redis at `REDIS_URL` and serve
-`config.asgi:application` with Uvicorn instead of `runserver`. The release and
-multi-worker Redis gate still requires the operator's rollout environment.
+`runserver` is plain WSGI and cannot upgrade a websocket, so the web app's Live
+indicator reports "unavailable" against it. For live updates, serve the ASGI app
+instead (no Redis needed locally):
+
+```powershell
+.\.venv\Scripts\python -m uvicorn config.asgi:application --host 127.0.0.1 --port 8000 --reload
+```
+
+Open the Vite app as either `http://localhost:5173` or `http://127.0.0.1:5173`; both
+origins are allowed in debug. The multi-worker Redis release gate still requires the
+operator's rollout environment.
 
 ### Web frontend
 
@@ -984,7 +1002,8 @@ has been deployed. Do not contact or alter the VPS from an implementation task.
 
 1. Back up `db.sqlite3` with a timestamp and verify the copy.
 2. Install Redis bound to `127.0.0.1:6379`, then set `REDIS_URL` in the VPS
-   environment. Keep `PINGO_MOBILE_V2_ENABLED=false` initially.
+   environment (required here because `--workers 2` below needs shared state).
+   Keep `PINGO_MOBILE_V2_ENABLED=false` initially.
 3. Deploy the backend code, install `requirements.txt`, and run migrations.
    Existing WSGI HTTP and v1 sync remain compatible while the change log fills.
 4. Replace only PM2's `pingo-api` command with

@@ -29,12 +29,22 @@ TEMPLATES = [{"BACKEND": "django.template.backends.django.DjangoTemplates", "DIR
               "OPTIONS": {"context_processors": ["django.template.context_processors.request", "django.contrib.auth.context_processors.auth", "django.contrib.messages.context_processors.messages"]}}]
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+# Redis is optional. Leave REDIS_URL unset for local development and for a single
+# process: the channel layer and socket-count cache then live in memory, so no
+# request waits on a Redis connection that does not exist. Set it when several
+# ASGI workers must share websocket groups and socket counts.
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PINGO_MOBILE_V2_ENABLED = os.getenv("PINGO_MOBILE_V2_ENABLED", "false").lower() == "true"
-CHANNEL_LAYERS = {"default": {"BACKEND": "channels_redis.core.RedisChannelLayer",
-                              "CONFIG": {"hosts": [REDIS_URL]}}}
-# Socket counts must be shared by all ASGI workers.
-CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": REDIS_URL}}
+if REDIS_URL:
+    # Bound the connect wait so an unreachable Redis fails fast. No read timeout on
+    # the channel layer: its receive path blocks on purpose.
+    CHANNEL_LAYERS = {"default": {"BACKEND": "channels_redis.core.RedisChannelLayer",
+                                  "CONFIG": {"hosts": [{"address": REDIS_URL, "socket_connect_timeout": 1}]}}}
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": REDIS_URL,
+                          "OPTIONS": {"socket_connect_timeout": 1, "socket_timeout": 1}}}
+else:
+    CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
 DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3",
                          "OPTIONS": {"init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
                                      "transaction_mode": "IMMEDIATE"}}}
@@ -56,7 +66,10 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "COERCE_DECIMAL_TO_STRING": False,
 }
-CORS_ALLOWED_ORIGINS = [origin for origin in (os.getenv("CORS_ALLOWED_ORIGINS") or "http://localhost:5173").split(",") if origin]
+# Origins are matched exactly, so a dev server opened as 127.0.0.1 and one opened as
+# localhost are different origins. Allow both only while DEBUG is on.
+_default_origins = "http://localhost:5173,http://127.0.0.1:5173" if DEBUG else "http://localhost:5173"
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in (os.getenv("CORS_ALLOWED_ORIGINS") or _default_origins).split(",") if origin.strip()]
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
 
