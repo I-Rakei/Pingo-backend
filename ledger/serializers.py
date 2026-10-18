@@ -252,8 +252,9 @@ def _public_debt_statement(debt):
     total = capital + interest = everything still due. Single loans keep
     capital apart from their interest periods. Multi-period instalments mix
     both, so each instalment's unpaid base is split in the loan's own
-    capital-to-interest ratio, and any overdue penalty counts as interest."""
-    from .services import money
+    capital-to-interest split (the same whole-number split as the amortization
+    schedule), and any overdue penalty counts as interest."""
+    from .services import capital_portions, money
 
     zero = Decimal("0")
     periods = list(debt.installments.all())
@@ -261,16 +262,17 @@ def _public_debt_statement(debt):
     capital = zero
     open_total = zero
     if debt.loan_type == Debt.LoanType.MULTI:
-        bases = sum(((item.base_amount or item.amount - item.penalty_amount) for item in periods), zero)
-        ratio = (debt.principal / bases) if bases > 0 else Decimal("1")
-    for item in periods:
+        period_bases = [(item.base_amount or item.amount - item.penalty_amount) for item in periods]
+        portions = capital_portions(debt.principal, period_bases)
+    for index, item in enumerate(periods):
         remaining = max(item.amount - item.paid_amount, zero)
         if remaining <= 0:
             continue
         open_total += remaining
         if debt.loan_type == Debt.LoanType.MULTI:
-            base = item.base_amount or item.amount - item.penalty_amount
-            capital += min(remaining, base) * ratio
+            base = period_bases[index]
+            if base > 0:
+                capital += min(remaining, base) * portions[index] / base
         due.append({"debtId": debt.reference, "kind": "installment" if debt.loan_type == Debt.LoanType.MULTI else "interest",
                     "number": item.number, "dueDate": item.due_date, "amount": remaining})
     if debt.loan_type == Debt.LoanType.SINGLE:

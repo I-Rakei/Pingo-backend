@@ -8,8 +8,14 @@ from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.test import TestCase
 
+from ledger import pdf_text
 from ledger.models import Debt, Installment, Payment
-from ledger.services import create_debt, equal_period_amounts, loan_installment_terms, money, reconcile_debt
+from ledger.pdf_documents import amounts_due
+from ledger.serializers import _public_debt_statement
+from ledger.services import (
+    amortization_schedule_for_debt, capital_portions, create_debt, equal_period_amounts,
+    loan_installment_terms, money, reconcile_debt,
+)
 
 
 def amounts(loan_type, principal, rate, duration):
@@ -64,6 +70,58 @@ class WholeNumberInstalmentTests(TestCase):
         self.assertEqual(debt.total, Decimal("9100.00"))
         self.assertEqual(debt.outstanding, Decimal("9100.00"))
         self.assertEqual([item.amount for item in debt.installments.order_by("number")], [Decimal("3033.00"), Decimal("3033.00"), Decimal("3034.00")])
+
+
+class CapitalInterestSplitTests(TestCase):
+    """Capital and interest inside each instalment are whole numbers too, and still add up exactly."""
+
+    def portions(self, principal, rate, duration):
+        total = money(Decimal(principal) + money(Decimal(principal) * Decimal(rate) / 100))
+        bases = equal_period_amounts(total, duration)
+        capital = capital_portions(Decimal(principal), bases)
+        return bases, capital, [base - share for base, share in zip(bases, capital)]
+
+    def test_the_seven_thousand_example(self):
+        bases, capital, interest = self.portions("7000", "30", 3)
+        self.assertEqual(capital, [Decimal("2334.00"), Decimal("2334.00"), Decimal("2332.00")])
+        self.assertEqual(interest, [Decimal("699.00"), Decimal("699.00"), Decimal("702.00")])
+
+    def test_always_whole_when_the_instalments_are_and_always_exact(self):
+        for principal, rate, duration in [("7000", "30", 3), ("12000", "10", 7), ("50000", "15", 6), ("1000", "7", 7),
+                                          ("250.50", "12.5", 6), ("12345.67", "17.5", 9), ("100", "1", 12), ("100", "0", 3), ("19980", "8", 12)]:
+            bases, capital, interest = self.portions(principal, rate, duration)
+            case = (principal, rate, duration, capital, interest)
+            self.assertEqual(sum(capital), money(Decimal(principal)), case)
+            self.assertEqual(sum(interest), money(sum(bases) - Decimal(principal)), case)
+            self.assertTrue(all(Decimal("0") <= share <= base for share, base in zip(capital, bases)), case)
+            self.assertTrue(all(share >= 0 for share in interest), case)
+            if Decimal(principal) == Decimal(principal).to_integral_value() and Decimal(rate) * Decimal(principal) % 100 == 0:
+                self.assertTrue(all(share == share.to_integral_value() for share in capital + interest), case)
+
+    def test_the_amortization_schedule_shows_whole_capital_and_interest(self):
+        owner = User.objects.create_user("split@example.com", "split@example.com", "password-123")
+        debt = new_debt(owner)
+        rows = amortization_schedule_for_debt(debt)["installments"]
+        self.assertEqual([row["principalAmount"] for row in rows], [Decimal("2334.00"), Decimal("2334.00"), Decimal("2332.00")])
+        self.assertEqual([row["interestAmount"] for row in rows], [Decimal("699.00"), Decimal("699.00"), Decimal("702.00")])
+        self.assertEqual(rows[-1]["capitalBalance"], Decimal("0.00"))
+
+    def test_the_clients_statement_and_the_invoice_split_what_is_still_owed_in_whole_numbers(self):
+        owner = User.objects.create_user("statement@example.com", "statement@example.com", "password-123")
+        debt = new_debt(owner)
+        summary, _ = _public_debt_statement(debt)
+        self.assertEqual((summary["capital"], summary["interest"], summary["total"]), (Decimal("7000.00"), Decimal("2100.00"), Decimal("9100.00")))
+
+        first = debt.installments.order_by("number").first()
+        Payment.objects.create(owner=owner, debt=debt, client=debt.client, installment=first, amount=first.amount,
+                               payment_type="principal", payment_date=date(2099, 1, 2))
+        reconcile_debt(debt)
+        debt.refresh_from_db()
+        summary, _ = _public_debt_statement(debt)
+        # Periods 2 and 3 remain: capital 2334 + 2332, interest 699 + 702 (the old ratio gave 4666.92 / 1400.08).
+        self.assertEqual((summary["capital"], summary["interest"], summary["total"]), (Decimal("4666.00"), Decimal("1401.00"), Decimal("6067.00")))
+        owed = amounts_due(debt, pdf_text.EN)
+        self.assertEqual((owed["capital"], owed["interest"], owed["total"]), (Decimal("4666.00"), Decimal("1401.00"), Decimal("6067.00")))
 
 
 class RepairInstallmentRoundingTests(TestCase):

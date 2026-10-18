@@ -39,6 +39,47 @@ def money(value):
     return Decimal(value).quantize(MONEY, rounding=ROUND_HALF_UP)
 
 
+def capital_portions(principal, bases):
+    """The capital inside each equal-period instalment (its base amount), in whole currency units.
+
+    Interest is shared out in proportion to the instalments, in whole units, with the remainder on the last
+    one; capital is then the instalment minus its interest. Both stay exact: the capital portions add up to
+    the principal and the interest portions to the interest, to the cent. When the instalments are whole
+    numbers, so are capital and interest (7000 at 30% over 3 periods: capital 2333 / 2333 / 2334).
+    If the interest is too small to share out in whole units, it falls back to cents."""
+    bases = list(bases)
+    total = sum(bases, Decimal("0"))
+    if not bases or total <= 0:
+        return [Decimal("0")] * len(bases)
+    interest_total = money(total - money(principal))
+
+    def share_out(rounding):
+        shares, left = [], interest_total
+        for index, base in enumerate(bases):
+            if index == len(bases) - 1:
+                share = left
+            else:
+                exact = interest_total * base / total
+                share = money(exact.to_integral_value(rounding=ROUND_FLOOR)) if rounding == "whole" else money(exact)
+                share = max(min(share, left), Decimal("0"))
+            shares.append(share)
+            left = money(left - share)
+        return shares
+
+    for rounding in ("whole", "cents"):
+        interest = share_out(rounding)
+        if all(Decimal("0") <= share <= base for share, base in zip(interest, bases)):
+            return [money(base - share) for base, share in zip(bases, interest)]
+    # Practically unreachable (a principal of a few cents): fill each instalment with as much of the
+    # principal as it can hold, so the capital still adds up exactly.
+    left, portions = money(principal), []
+    for base in bases:
+        share = min(base, left)
+        portions.append(share)
+        left = money(left - share)
+    return portions
+
+
 def _amortization_rows(principal, loan_type, installments, capital_paid=Decimal("0")):
     """Present ledger instalments without changing their recorded amounts.
 
@@ -49,12 +90,12 @@ def _amortization_rows(principal, loan_type, installments, capital_paid=Decimal(
     rows = []
     bases = [item["base"] for item in installments]
     base_total = sum(bases, Decimal("0"))
+    portions = capital_portions(principal, bases) if loan_type == Debt.LoanType.MULTI and base_total else []
     capital_left = principal
     for index, item in enumerate(installments):
         base = item["base"]
-        if loan_type == Debt.LoanType.MULTI and base_total:
-            planned_capital = capital_left if index == len(installments) - 1 else money(principal * base / base_total)
-            capital = min(base, planned_capital)
+        if portions:
+            capital = portions[index]
             capital_left = money(capital_left - capital)
         else:
             capital = Decimal("0")

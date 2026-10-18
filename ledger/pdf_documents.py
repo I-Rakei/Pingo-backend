@@ -18,7 +18,7 @@ from .pdf_render import BRAND, CONTENT_WIDTH, INK, MARGIN, MUTED, RIGHT, STATUS,
 from .pdf_store import DocumentNotFound  # noqa: F401  (re-exported for callers of this module)
 from .services import (
     amortization_schedule_for_debt, amortization_schedule_for_plan, assess_overdue_penalties,
-    get_membership, money, resolve_scope, simulate_amortization_schedule,
+    capital_portions, get_membership, money, resolve_scope, simulate_amortization_schedule,
 )
 
 FISCAL_MODELS = {"invoice": Invoice, "debit_note": DebitNote, "credit_note": CreditNote, "balance_note": BalanceNote}
@@ -78,16 +78,19 @@ def amounts_due(debt, copy):
 
     Paid periods and repaid capital are left out, matching the client's share link."""
     multi = debt.loan_type == Debt.LoanType.MULTI
-    # Multi-period instalments mix capital and interest; split each open amount in the loan's own ratio.
-    capital_share = 1 / (1 + Decimal(debt.interest_rate) / 100)
+    periods = list(debt.installments.order_by("number"))
+    # Multi-period instalments mix capital and interest; each open amount keeps the capital share of its own
+    # instalment, so the split matches the amortization schedule and is whole whenever the instalments are.
+    bases = [(period.base_amount or period.amount - period.penalty_amount) for period in periods]
+    portions = capital_portions(debt.principal, bases) if multi else []
     items = []
     capital = Decimal("0")
-    for period in debt.installments.order_by("number"):
+    for index, period in enumerate(periods):
         remaining = money(period.amount - period.paid_amount)
         if remaining <= 0:
             continue
-        if multi:
-            capital += remaining * capital_share
+        if multi and bases[index] > 0:
+            capital += min(remaining, bases[index]) * portions[index] / bases[index]
         description = copy["instalment"](period.number) if multi else copy["interestPeriod"](period.number)
         items.append({"description": description, "dueDate": period.due_date, "amount": remaining})
     if not multi:
